@@ -1,0 +1,63 @@
+{
+    "author": "moaskefoto@gmail.com",
+    "dependencies": {},
+    "keywords": [],
+    "name": "windsock",
+    "pebble": {
+        "capabilities": [
+            "location",
+            "configurable"
+        ],
+        "displayName": "WindSock",
+        "enableMultiJS": true,
+        "messageKeys": [
+            "REQUEST",
+            "FORECAST_DATA",
+            "ERROR",
+            "LOCATION_NAME"
+        ],
+        "projectType": "native",
+        "resources": {
+            "media": [
+                {
+                    "file": "images/windsock_app_icon.png",
+                    "menuIcon": true,
+                    "name": "WINDSOCK_APP_ICON",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/graph.png",
+                    "name": "GRAPH",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/refresh.png",
+                    "name": "REFRESH",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/list_forecast.png",
+                    "name": "LIST_FORECAST",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                }
+            ]
+        },
+        "sdkVersion": "3",
+        "targetPlatforms": [
+            "aplite",
+            "basalt",
+            "diorite",
+            "emery",
+            "flint"
+        ],
+        "uuid": "169d9b9a-4937-4cd8-b848-f6af8e002654",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "1.3.1"
+}
