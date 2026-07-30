@@ -436,7 +436,7 @@ static void main_window_load(Window *window) {
   // Direction arrow sits inline on the same row as "At 10m:" rather than
   // overlapping the location name above it - avoids any cutoff.
   int row1_h = arrow_size > label_h ? arrow_size : label_h;
-  int label_y_offset = row1_h - label_h; // vertically center label within the taller row
+  int label_y_offset = row1_h - label_h; // align label to bottom within the taller row
 
   s_lbl_10m_layer = text_layer_create(GRect(4, y + label_y_offset, content_width - arrow_size - 12, label_h));
   text_layer_set_font(s_lbl_10m_layer, font_label);
