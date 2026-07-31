@@ -2,11 +2,13 @@
 
 #define MAX_ROWS 24
 #define GRAPH_POINTS 24
-#define ACTIONBAR_ICON_WIDTH 30
+// ACTIONBAR_ICON_WIDTH removed - use the SDK's own ACTION_BAR_WIDTH macro
+// instead, since it resolves per-platform and is the correct source of
+// truth (a hardcoded 30px caused a slight overlap on Emery).
 #define NO_DATA -999
-#define HEADER_HEIGHT 20
+#define HEADER_HEIGHT 22
 #define ROW_HEIGHT 26
-#define TIME_COL_W 22
+#define TIME_COL_W 54
 
 typedef struct {
   int hour;
@@ -82,7 +84,7 @@ static GColor eaqi_to_fg_color(int aqi) {
 }
 
 static const char *eaqi_to_label(int aqi) {
-  if (aqi < 0) return "Unknown";
+  if (aqi < 0) return "N/A";
   if (aqi < 20) return "Good";
   if (aqi < 40) return "Fair";
   if (aqi < 60) return "Moderate";
@@ -401,6 +403,7 @@ static void refresh_main_window(void) {
     layer_set_hidden(text_layer_get_layer(s_main_status_layer), false);
     layer_set_hidden(s_grid_layer, true);
     text_layer_set_text(s_eaqi_layer, "");
+    text_layer_set_background_color(s_eaqi_layer, GColorClear);
     return;
   }
   layer_set_hidden(text_layer_get_layer(s_main_status_layer), true);
@@ -419,6 +422,8 @@ static void refresh_main_window(void) {
   GFont eaqi_font = pick_fit_font(eaqi_buf, eaqi_bounds.size.w - 4, eaqi_candidates, 3);
   text_layer_set_font(s_eaqi_layer, eaqi_font);
   text_layer_set_text(s_eaqi_layer, eaqi_buf);
+  text_layer_set_background_color(s_eaqi_layer, eaqi_to_bg_color(s_current.aqi_overall));
+  text_layer_set_text_color(s_eaqi_layer, eaqi_to_fg_color(s_current.aqi_overall));
 }
 
 static void main_up_click(ClickRecognizerRef recognizer, void *context) {
@@ -442,7 +447,7 @@ static void main_click_config_provider(void *context) {
 static void main_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
-  int content_width = bounds.size.w - ACTIONBAR_ICON_WIDTH;
+  int content_width = bounds.size.w - ACTION_BAR_WIDTH;
 
   s_action_bar = action_bar_layer_create();
   action_bar_layer_add_to_window(s_action_bar, window);
@@ -457,7 +462,7 @@ static void main_window_load(Window *window) {
   action_bar_layer_set_icon(s_action_bar, BUTTON_ID_DOWN, s_icon_list_forecast);
   action_bar_layer_set_icon(s_action_bar, BUTTON_ID_SELECT, s_icon_refresh);
 
-  int loc_h = 26;
+  int loc_h = 30; // was 26 - a few extra px so the location text stops clipping at the bottom
   int eaqi_h = 26; // same size as location, per request
 
   s_location_layer = text_layer_create(GRect(4, 0, content_width - 8, loc_h));
@@ -507,26 +512,44 @@ static void main_window_unload(Window *window) {
 
 static int forecast_col_x(int window_width, int col_index) {
   int value_area = window_width - TIME_COL_W;
-  int col_w = value_area / 6;
+  int col_w = value_area / 4;
   return TIME_COL_W + col_index * col_w;
 }
 
 static int forecast_col_w(int window_width) {
   int value_area = window_width - TIME_COL_W;
-  return value_area / 6;
+  return value_area / 4;
 }
 
 static void forecast_header_update_proc(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
-  static const char *headers[6] = {"PM2.5", "PM10", "NO2", "O3", "Temp", "UV"};
-  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_09);
+  static const char *headers[4] = {"PM2.5", "PM10", "NO2", "O3"};
   int col_w = forecast_col_w(b.size.w);
+
+  // Try the biggest font first; only use it if every label still fits its
+  // column at that size, so a short label like "O3" doesn't force a size
+  // too big for "PM2.5" to fit.
+  GFont header_candidates[2] = {
+    fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    fonts_get_system_font(FONT_KEY_GOTHIC_09)
+  };
+  GFont font = header_candidates[1];
+  for (int f = 0; f < 2; f++) {
+    bool all_fit = true;
+    for (int i = 0; i < 4; i++) {
+      GSize sz = graphics_text_layout_get_content_size(headers[i], header_candidates[f],
+                                                         GRect(0, 0, 500, 30),
+                                                         GTextOverflowModeFill, GTextAlignmentLeft);
+      if (sz.w > col_w - 4) { all_fit = false; break; }
+    }
+    if (all_fit) { font = header_candidates[f]; break; }
+  }
 
   graphics_context_set_fill_color(ctx, GColorLightGray);
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
   graphics_context_set_text_color(ctx, GColorBlack);
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < 4; i++) {
     GRect cell = GRect(forecast_col_x(b.size.w, i), 0, col_w, b.size.h);
     draw_centered_text(ctx, headers[i], font, cell);
   }
@@ -548,20 +571,18 @@ static void draw_forecast_row(GContext *ctx, int row_index, int y, int width) {
   graphics_context_set_fill_color(ctx, GColorWhite);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
-  char hour_buf[4], v[6][6];
-  snprintf(hour_buf, sizeof(hour_buf), "%02d", r->hour);
+  char hour_buf[6], v[4][6];
+  snprintf(hour_buf, sizeof(hour_buf), "%02d:00", r->hour);
   fmt_int(v[0], sizeof(v[0]), r->pm25);
   fmt_int(v[1], sizeof(v[1]), r->pm10);
   fmt_int(v[2], sizeof(v[2]), r->no2);
   fmt_int(v[3], sizeof(v[3]), r->o3);
-  fmt_int(v[4], sizeof(v[4]), r->temp);
-  fmt_uv(v[5], sizeof(v[5]), r->uv10);
 
   graphics_context_set_text_color(ctx, GColorBlack);
   draw_centered_text(ctx, hour_buf, time_font, GRect(0, y, TIME_COL_W, ROW_HEIGHT));
 
   int col_w = forecast_col_w(width);
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < 4; i++) {
     GRect cell = GRect(forecast_col_x(width, i), y, col_w, ROW_HEIGHT);
     draw_centered_text(ctx, v[i], value_font, cell);
   }
