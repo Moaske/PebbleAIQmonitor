@@ -2,7 +2,7 @@
 Air Quality and Pollen monitor for Pebble Time 2 (Emery)
 
 ## Features
-- Main screen with PM2.5, PM10, NO2, Ozone (O3) polutant values as wel as Temperature and UV Index at the current locationm (shown on top) and at the bottom the general European Air Quality Index
+- Main screen with PM2.5, PM10, NO2, Ozone (O3) polutant values as wel as Temperature and UV Index at the current location (shown on top) and at the bottom the general European Air Quality Index
 - Background of cells changes colours according to EU threshold values (severity)
 - Forecast screen with 24hr hourly forecast for each polutant, scrollable with both touch and buttons
 - Pollen screen with Birch and Grass pollen 24hr forecast values in a graph (Europe only!)
