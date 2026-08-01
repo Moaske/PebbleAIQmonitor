@@ -1,4 +1,4 @@
-# Pebble AIQ monitor
+# Pebble AQI monitor
 Air Quality and Pollen monitor for Pebble Time 2 (Emery)
 
 ## Features
