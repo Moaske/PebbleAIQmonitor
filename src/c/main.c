@@ -71,11 +71,11 @@ static void refresh_main_window(void);
 static GColor eaqi_to_bg_color(int aqi) {
   if (aqi < 0) return GColorWhite;                 // unknown
   if (aqi < 20) return GColorFromRGB(0, 255, 0);    // Good
-  if (aqi < 40) return GColorFromRGB(170, 210, 0);  // Fair
-  if (aqi < 60) return GColorFromRGB(255, 190, 0);  // Moderate
-  if (aqi < 80) return GColorFromRGB(255, 120, 0);  // Poor
-  if (aqi < 100) return GColorFromRGB(220, 0, 0);   // Very poor
-  return GColorFromRGB(120, 0, 60);                  // Extremely poor
+  if (aqi < 40) return GColorFromRGB(170, 255, 0);  // Fair
+  if (aqi < 60) return GColorFromRGB(255, 170, 0);  // Moderate
+  if (aqi < 80) return GColorFromRGB(255, 85, 0);  // Poor
+  if (aqi < 100) return GColorFromRGB(255, 0, 0);   // Very poor
+  return GColorFromRGB(170, 0, 85);                  // Extremely poor
 }
 
 static GColor eaqi_to_fg_color(int aqi) {
