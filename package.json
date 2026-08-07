@@ -1,30 +1,30 @@
 {
-    "author": "Moaske",
+    "author": "moaskefoto@gmail.com",
     "dependencies": {},
     "keywords": [],
-    "name": "aqi-monitor",
+    "name": "windsock",
     "pebble": {
         "capabilities": [
-            "location"
+            "location",
+            "configurable"
         ],
-        "displayName": "AQI Monitor",
+        "displayName": "WindSock",
         "enableMultiJS": true,
         "messageKeys": [
             "REQUEST",
-            "LOCATION_NAME",
-            "ERROR",
-            "CURRENT_DATA",
             "FORECAST_DATA",
-            "POLLEN_SEASON",
-            "GRAPH_DATA"
+            "ERROR",
+            "LOCATION_NAME",
+            "WIND_UNIT",
+            "MODEL_TYPE"
         ],
         "projectType": "native",
         "resources": {
             "media": [
                 {
-                    "file": "images/airquality_app_icon.png",
+                    "file": "images/windsock_app_icon.png",
                     "menuIcon": true,
-                    "name": "AIRQUALITY_APP_ICON",
+                    "name": "WINDSOCK_APP_ICON",
                     "targetPlatforms": null,
                     "type": "bitmap"
                 },
@@ -50,12 +50,16 @@
         },
         "sdkVersion": "3",
         "targetPlatforms": [
-            "emery"
+            "aplite",
+            "basalt",
+            "diorite",
+            "emery",
+            "flint"
         ],
-        "uuid": "11ae3d58-5fda-4730-97eb-cc61742dcdd6",
+        "uuid": "169d9b9a-4937-4cd8-b848-f6af8e002654",
         "watchapp": {
             "watchface": false
         }
     },
-    "version": "1.0.4"
+    "version": "1.5.0"
 }

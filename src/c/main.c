@@ -1,39 +1,54 @@
 #include <pebble.h>
 
 #define MAX_ROWS 24
-#define GRAPH_POINTS 24
-// ACTIONBAR_ICON_WIDTH removed - use the SDK's own ACTION_BAR_WIDTH macro
-// instead, since it resolves per-platform and is the correct source of
-// truth (a hardcoded 30px caused a slight overlap on Emery).
-#define NO_DATA -999
-#define HEADER_HEIGHT 22
-#define ROW_HEIGHT 26
-#define TIME_COL_W 54
+#define GRAPH_POINTS 6
+#define ACTIONBAR_ICON_WIDTH 30
+
+// Wind unit: 0 = km/h (default), 1 = mph, 2 = m/s, 3 = knots. Values
+// arriving from the phone are already converted to this unit - the watch
+// never converts.
+static int s_wind_unit = 0;
+static const char *WIND_UNIT_SUFFIX[4] = {"km/h", "mph", "m/s", "kts"};
+
+// Model type: 0 = Global (best_match, ~120m altitude), 1 = Benelux (KNMI,
+// true 100m altitude). Only affects the "At Xm:" label text.
+static int s_model_type = 0;
+
+// Per-unit graph scale: {0, low grid mark, red-warning threshold, axis max}.
+// Roughly-equivalent round numbers per unit rather than exact conversions,
+// so the axis still reads cleanly regardless of which unit is selected.
+static const int GRAPH_MARKS_KMH[4] = {0, 30, 45, 60};
+static const int GRAPH_MARKS_MPH[4] = {0, 15, 28, 40};
+static const int GRAPH_MARKS_MS[4]  = {0, 7, 13, 20};
+static const int GRAPH_MARKS_KTS[4] = {0, 15, 24, 32};
+
+static const int *current_graph_marks(void) {
+  if (s_wind_unit == 1) return GRAPH_MARKS_MPH;
+  if (s_wind_unit == 2) return GRAPH_MARKS_MS;
+  if (s_wind_unit == 3) return GRAPH_MARKS_KTS;
+  return GRAPH_MARKS_KMH;
+}
+
+static int red_threshold(void) {
+  return current_graph_marks()[2];
+}
+
+static int graph_y_max(void) {
+  return current_graph_marks()[3];
+}
 
 typedef struct {
   int hour;
-  int pm25, pm10, no2, o3, temp, uv10; // uv10 = uv * 10 (one implied decimal)
+  int wind10;
+  int gusts;
+  int wind100;
+  int dir; // degrees, 0-359, 0 = north
 } ForecastRow;
-
-typedef struct {
-  int hour;
-  int birch, grass; // grains/m3
-} GraphPoint;
-
-typedef struct {
-  int pm25, pm10, no2, o3, temp, uv10;
-  int aqi_pm25, aqi_pm10, aqi_no2, aqi_o3; // European AQI sub-indices, -1 = unknown
-  int aqi_overall; // Consolidated European AQI (max of sub-indices), -1 = unknown
-} CurrentData;
 
 static ForecastRow s_rows[MAX_ROWS];
 static int s_row_count = 0;
-static GraphPoint s_graph[GRAPH_POINTS];
-static int s_graph_count = 0;
-static bool s_pollen_season = false;
-static CurrentData s_current;
 static char s_location_name[32] = "Locating...";
-static char s_status_text[48] = "Fetching air quality...";
+static char s_status_text[48] = "Fetching forecast...";
 static bool s_has_data = false;
 
 // --- Windows ---
@@ -46,91 +61,53 @@ static ActionBarLayer *s_action_bar;
 static GBitmap *s_icon_graph;
 static GBitmap *s_icon_list_forecast;
 static GBitmap *s_icon_refresh;
-static TextLayer *s_location_layer;
-static TextLayer *s_eaqi_layer;
-static Layer *s_grid_layer;
+static Layer *s_location_layer;
+static GFont s_location_font;
+static int s_location_scroll_offset = 0;
+static int s_location_scroll_max = 0;
+static bool s_location_scroll_forward = true;
+static AppTimer *s_location_scroll_timer;
+#define LOCATION_SCROLL_STEP_MS 50
+#define LOCATION_SCROLL_PAUSE_MS 800
+static TextLayer *s_lbl_10m_layer, *s_val_10m_layer;
+static TextLayer *s_lbl_gusts_layer, *s_val_gusts_layer;
+static TextLayer *s_lbl_100m_layer, *s_val_100m_layer;
+static Layer *s_main_arrow_layer;
 static TextLayer *s_main_status_layer;
+static char s_val_10m_buf[16], s_val_gusts_buf[16], s_val_100m_buf[16];
 
 // --- Forecast window widgets ---
-static Layer *s_forecast_header_layer;
-static ScrollLayer *s_scroll_layer;
-static Layer *s_forecast_content_layer;
-static GPoint s_touch_last_point;
+static MenuLayer *s_menu_layer;
 static TextLayer *s_forecast_status_layer;
 
 // --- Graph window widgets ---
 static Layer *s_graph_layer;
 static TextLayer *s_graph_status_layer;
 
+static GColor color_for_value(int value) {
+  return value > red_threshold() ? GColorDarkCandyAppleRed : GColorBlack;
+}
+
 static void refresh_main_window(void);
+static void update_all_status_displays(void);
+static void trigger_location_scroll(void);
 
-// ---------------------------------------------------------------------
-// Colour mapping - European AQI sub-index -> background colour
-// ---------------------------------------------------------------------
+static AppTimer *s_timeout_timer;
+#define FORECAST_TIMEOUT_MS 25000
 
-static GColor eaqi_to_bg_color(int aqi) {
-  if (aqi < 0) return GColorWhite;                 // unknown
-  if (aqi < 20) return GColorFromRGB(0, 255, 0);    // Good
-  if (aqi < 40) return GColorFromRGB(170, 255, 0);  // Fair
-  if (aqi < 60) return GColorFromRGB(255, 170, 0);  // Moderate
-  if (aqi < 80) return GColorFromRGB(255, 85, 0);  // Poor
-  if (aqi < 100) return GColorFromRGB(255, 0, 0);   // Very poor
-  return GColorFromRGB(170, 0, 85);                  // Extremely poor
-}
-
-static GColor eaqi_to_fg_color(int aqi) {
-  if (aqi >= 80) return GColorWhite;
-  return GColorBlack;
-}
-
-static const char *eaqi_to_label(int aqi) {
-  if (aqi < 0) return "N/A";
-  if (aqi < 20) return "Good";
-  if (aqi < 40) return "Fair";
-  if (aqi < 60) return "Moderate";
-  if (aqi < 80) return "Poor";
-  if (aqi < 100) return "Very Poor";
-  return "Extremely Poor";
-}
-
-// ---------------------------------------------------------------------
-// Text helpers
-// ---------------------------------------------------------------------
-
-// Picks the largest font from a list (ordered biggest to smallest) whose
-// rendered width still fits inside max_width.
-static GFont pick_fit_font(const char *text, int max_width, const GFont *candidates, int count) {
-  for (int i = 0; i < count; i++) {
-    GSize sz = graphics_text_layout_get_content_size(text, candidates[i], GRect(0, 0, 500, 60),
-                                                       GTextOverflowModeFill, GTextAlignmentLeft);
-    if (sz.w <= max_width) return candidates[i];
-  }
-  return candidates[count - 1];
-}
-
-// Draws text horizontally AND vertically centered within box.
-static void draw_centered_text(GContext *ctx, const char *text, GFont font, GRect box) {
-  GSize sz = graphics_text_layout_get_content_size(text, font, GRect(0, 0, box.size.w, 200),
-                                                     GTextOverflowModeFill, GTextAlignmentCenter);
-  int y_off = (box.size.h - sz.h) / 2;
-  if (y_off < 0) y_off = 0;
-  GRect r = GRect(box.origin.x, box.origin.y + y_off, box.size.w, sz.h + 2);
-  graphics_draw_text(ctx, text, font, r, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
-}
-
-static void fmt_int(char *buf, size_t buflen, int v) {
-  if (v == NO_DATA) {
-    strncpy(buf, "--", buflen - 1);
-  } else {
-    snprintf(buf, buflen, "%d", v);
+static void cancel_timeout_timer(void) {
+  if (s_timeout_timer) {
+    app_timer_cancel(s_timeout_timer);
+    s_timeout_timer = NULL;
   }
 }
 
-static void fmt_uv(char *buf, size_t buflen, int uv10) {
-  if (uv10 == NO_DATA) {
-    strncpy(buf, "--", buflen - 1);
-  } else {
-    snprintf(buf, buflen, "%d.%d", uv10 / 10, abs(uv10) % 10);
+static void timeout_handler(void *data) {
+  s_timeout_timer = NULL;
+  if (!s_has_data) {
+    strncpy(s_status_text, "Timed out. Press Select to retry.", sizeof(s_status_text) - 1);
+    s_status_text[sizeof(s_status_text) - 1] = '\0';
+    update_all_status_displays();
   }
 }
 
@@ -138,12 +115,14 @@ static void fmt_uv(char *buf, size_t buflen, int uv10) {
 // Data request / parsing
 // ---------------------------------------------------------------------
 
-static void request_data(void) {
+static void request_forecast(void) {
   s_has_data = false;
   s_row_count = 0;
-  s_graph_count = 0;
-  strncpy(s_status_text, "Fetching air quality...", sizeof(s_status_text) - 1);
+  strncpy(s_status_text, "Fetching forecast...", sizeof(s_status_text) - 1);
   refresh_main_window();
+
+  cancel_timeout_timer();
+  s_timeout_timer = app_timer_register(FORECAST_TIMEOUT_MS, timeout_handler, NULL);
 
   DictionaryIterator *iter;
   if (app_message_outbox_begin(&iter) == APP_MSG_OK && iter) {
@@ -152,155 +131,65 @@ static void request_data(void) {
   }
 }
 
-static void parse_current(const char *data) {
-  int vals[11];
-  char buffer[128];
-  strncpy(buffer, data, sizeof(buffer) - 1);
-  buffer[sizeof(buffer) - 1] = '\0';
-
-  char *cursor = buffer;
-  int idx = 0;
-  while (cursor && *cursor && idx < 11) {
-    char *next = strchr(cursor, ',');
-    if (next) *next = '\0';
-    vals[idx++] = atoi(cursor);
-    cursor = next ? next + 1 : NULL;
-  }
-  if (idx < 11) return;
-
-  s_current.pm25 = vals[0];
-  s_current.pm10 = vals[1];
-  s_current.no2 = vals[2];
-  s_current.o3 = vals[3];
-  s_current.temp = vals[4];
-  s_current.uv10 = vals[5];
-  s_current.aqi_pm25 = vals[6];
-  s_current.aqi_pm10 = vals[7];
-  s_current.aqi_no2 = vals[8];
-  s_current.aqi_o3 = vals[9];
-  s_current.aqi_overall = vals[10];
-}
-
 static void parse_forecast(const char *data) {
   s_row_count = 0;
-  static char buffer[1200];
+  static char buffer[900];
   strncpy(buffer, data, sizeof(buffer) - 1);
   buffer[sizeof(buffer) - 1] = '\0';
 
   char *cursor = buffer;
   while (cursor && *cursor && s_row_count < MAX_ROWS) {
     char *next_row = strchr(cursor, '|');
-    if (next_row) *next_row = '\0';
-
-    int vals[7];
-    char *p = cursor;
-    int idx = 0;
-    bool ok = true;
-    while (idx < 7) {
-      char *c = strchr(p, ',');
-      if (idx < 6 && !c) { ok = false; break; }
-      if (c) *c = '\0';
-      vals[idx++] = atoi(p);
-      if (!c) break;
-      p = c + 1;
+    if (next_row) {
+      *next_row = '\0';
     }
 
-    if (ok && idx == 7) {
-      ForecastRow *row = &s_rows[s_row_count];
-      row->hour = vals[0];
-      row->pm25 = vals[1];
-      row->pm10 = vals[2];
-      row->no2 = vals[3];
-      row->o3 = vals[4];
-      row->temp = vals[5];
-      row->uv10 = vals[6];
-      s_row_count++;
-    }
-
-    cursor = next_row ? next_row + 1 : NULL;
-  }
-}
-
-static void parse_graph(const char *data) {
-  s_graph_count = 0;
-  static char buffer[700];
-  strncpy(buffer, data, sizeof(buffer) - 1);
-  buffer[sizeof(buffer) - 1] = '\0';
-
-  char *cursor = buffer;
-  while (cursor && *cursor && s_graph_count < GRAPH_POINTS) {
-    char *next_row = strchr(cursor, '|');
-    if (next_row) *next_row = '\0';
-
     char *p = cursor;
+    char *hour_s = p;
     char *c1 = strchr(p, ',');
     if (!c1) { cursor = next_row ? next_row + 1 : NULL; continue; }
-    *c1 = '\0';
-    char *hour_s = p;
-    p = c1 + 1;
+    *c1 = '\0'; p = c1 + 1;
 
+    char *w10_s = p;
     char *c2 = strchr(p, ',');
     if (!c2) { cursor = next_row ? next_row + 1 : NULL; continue; }
-    *c2 = '\0';
-    char *birch_s = p;
-    char *grass_s = c2 + 1;
+    *c2 = '\0'; p = c2 + 1;
 
-    s_graph[s_graph_count].hour = atoi(hour_s);
-    s_graph[s_graph_count].birch = atoi(birch_s);
-    s_graph[s_graph_count].grass = atoi(grass_s);
-    s_graph_count++;
+    char *gust_s = p;
+    char *c3 = strchr(p, ',');
+    if (!c3) { cursor = next_row ? next_row + 1 : NULL; continue; }
+    *c3 = '\0'; p = c3 + 1;
+
+    char *w100_s = p;
+    char *c4 = strchr(p, ',');
+    if (!c4) { cursor = next_row ? next_row + 1 : NULL; continue; }
+    *c4 = '\0'; p = c4 + 1;
+
+    char *dir_s = p;
+
+    s_rows[s_row_count].hour    = atoi(hour_s);
+    s_rows[s_row_count].wind10  = atoi(w10_s);
+    s_rows[s_row_count].gusts   = atoi(gust_s);
+    s_rows[s_row_count].wind100 = atoi(w100_s);
+    s_rows[s_row_count].dir     = atoi(dir_s);
+    s_row_count++;
 
     cursor = next_row ? next_row + 1 : NULL;
   }
 }
 
-static void inbox_received_handler(DictionaryIterator *iter, void *context) {
-  Tuple *err_tuple = dict_find(iter, MESSAGE_KEY_ERROR);
-  Tuple *cur_tuple = dict_find(iter, MESSAGE_KEY_CURRENT_DATA);
-  Tuple *fc_tuple = dict_find(iter, MESSAGE_KEY_FORECAST_DATA);
-  Tuple *loc_tuple = dict_find(iter, MESSAGE_KEY_LOCATION_NAME);
-  Tuple *season_tuple = dict_find(iter, MESSAGE_KEY_POLLEN_SEASON);
-  Tuple *graph_tuple = dict_find(iter, MESSAGE_KEY_GRAPH_DATA);
-
-  if (loc_tuple) {
-    strncpy(s_location_name, loc_tuple->value->cstring, sizeof(s_location_name) - 1);
-    s_location_name[sizeof(s_location_name) - 1] = '\0';
-  }
-
-  if (err_tuple) {
-    snprintf(s_status_text, sizeof(s_status_text), "Error: %s", err_tuple->value->cstring);
-    s_has_data = false;
-  } else if (cur_tuple && fc_tuple) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "CURRENT_DATA raw: %s", cur_tuple->value->cstring);
-    parse_current(cur_tuple->value->cstring);
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "Parsed aqi_overall: %d", s_current.aqi_overall);
-    parse_forecast(fc_tuple->value->cstring);
-    s_pollen_season = season_tuple ? (season_tuple->value->int32 != 0) : false;
-    if (s_pollen_season && graph_tuple) {
-      parse_graph(graph_tuple->value->cstring);
-    }
-    s_has_data = (s_row_count > 0);
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "row_count: %d, has_data: %d", s_row_count, s_has_data);
-    if (!s_has_data) {
-      strncpy(s_status_text, "No data received", sizeof(s_status_text) - 1);
-    }
-  }
-
+static void update_all_status_displays(void) {
   refresh_main_window();
 
-  if (s_scroll_layer) {
+  if (s_has_data) {
+    trigger_location_scroll();
+  }
+
+  if (s_menu_layer) {
     text_layer_set_text(s_forecast_status_layer, s_has_data ? "" : s_status_text);
     layer_set_hidden(text_layer_get_layer(s_forecast_status_layer), s_has_data);
-    layer_set_hidden(scroll_layer_get_layer(s_scroll_layer), !s_has_data);
-    layer_set_hidden(s_forecast_header_layer, !s_has_data);
-
-    int content_h = s_row_count * ROW_HEIGHT;
-    GRect frame = layer_get_bounds(scroll_layer_get_layer(s_scroll_layer));
-    if (content_h < frame.size.h) content_h = frame.size.h;
-    scroll_layer_set_content_size(s_scroll_layer, GSize(frame.size.w, content_h));
-    scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false); // reset to top on refresh
-    layer_set_frame(s_forecast_content_layer, GRect(0, 0, frame.size.w, content_h));
-    layer_mark_dirty(s_forecast_content_layer);
+    layer_set_hidden(menu_layer_get_layer(s_menu_layer), !s_has_data);
+    menu_layer_reload_data(s_menu_layer);
   }
 
   if (s_graph_layer) {
@@ -311,119 +200,231 @@ static void inbox_received_handler(DictionaryIterator *iter, void *context) {
   }
 }
 
+static void inbox_received_handler(DictionaryIterator *iter, void *context) {
+  cancel_timeout_timer();
+
+  Tuple *err_tuple    = dict_find(iter, MESSAGE_KEY_ERROR);
+  Tuple *data_tuple   = dict_find(iter, MESSAGE_KEY_FORECAST_DATA);
+  Tuple *loc_tuple    = dict_find(iter, MESSAGE_KEY_LOCATION_NAME);
+  Tuple *unit_tuple   = dict_find(iter, MESSAGE_KEY_WIND_UNIT);
+  Tuple *model_tuple  = dict_find(iter, MESSAGE_KEY_MODEL_TYPE);
+
+  if (loc_tuple) {
+    strncpy(s_location_name, loc_tuple->value->cstring, sizeof(s_location_name) - 1);
+    s_location_name[sizeof(s_location_name) - 1] = '\0';
+  }
+
+  if (unit_tuple) {
+    int u = (int)unit_tuple->value->int32;
+    if (u >= 0 && u <= 3) {
+      s_wind_unit = u;
+    }
+  }
+
+  if (model_tuple) {
+    int m = (int)model_tuple->value->int32;
+    if (m == 0 || m == 1) {
+      s_model_type = m;
+    }
+  }
+
+  if (err_tuple) {
+    snprintf(s_status_text, sizeof(s_status_text), "Error: %s", err_tuple->value->cstring);
+    s_has_data = false;
+  } else if (data_tuple) {
+    parse_forecast(data_tuple->value->cstring);
+    s_has_data = (s_row_count > 0);
+    if (!s_has_data) {
+      strncpy(s_status_text, "No data received", sizeof(s_status_text) - 1);
+    }
+  }
+
+  update_all_status_displays();
+}
+
 static void inbox_dropped_handler(AppMessageResult reason, void *context) {
-  strncpy(s_status_text, "Message dropped", sizeof(s_status_text) - 1);
+  cancel_timeout_timer();
+  strncpy(s_status_text, "Message dropped. Press Select to retry.", sizeof(s_status_text) - 1);
   s_has_data = false;
-  refresh_main_window();
+  update_all_status_displays();
 }
 
 static void outbox_failed_handler(DictionaryIterator *iter, AppMessageResult reason, void *context) {
-  strncpy(s_status_text, "Send to phone failed", sizeof(s_status_text) - 1);
+  cancel_timeout_timer();
+  strncpy(s_status_text, "Send to phone failed. Press Select to retry.", sizeof(s_status_text) - 1);
   s_has_data = false;
-  refresh_main_window();
+  update_all_status_displays();
 }
 
 // ---------------------------------------------------------------------
-// MAIN window - location + 2x3 colour-coded box grid
+// Wind direction arrow (shared helper) - 0 degrees = up = north, clockwise
 // ---------------------------------------------------------------------
 
-static void main_grid_update_proc(Layer *layer, GContext *ctx) {
+static const GPathInfo ARROW_PATH_SMALL = {
+  .num_points = 4,
+  .points = (GPoint[]) {{0, -10}, {7, 8}, {0, 3}, {-7, 8}}
+};
+
+static const GPathInfo ARROW_PATH_MEDIUM = {
+  .num_points = 4,
+  .points = (GPoint[]) {{0, -15}, {10, 12}, {0, 4}, {-10, 12}}
+};
+
+static void draw_wind_arrow_ex(GContext *ctx, GPoint center, int direction_degrees,
+                                const GPathInfo *path_info, GColor color) {
+  GPath *path = gpath_create(path_info);
+  gpath_move_to(path, center);
+  // Vane convention: arrow points into the wind (where it's blowing FROM),
+  // which is 180 degrees opposite the raw "blowing toward" bearing.
+  int flipped_degrees = (direction_degrees + 180) % 360;
+  int32_t angle = (flipped_degrees * TRIG_MAX_ANGLE) / 360;
+  gpath_rotate_to(path, angle);
+  graphics_context_set_fill_color(ctx, color);
+  gpath_draw_filled(ctx, path);
+  gpath_destroy(path);
+}
+
+static void draw_wind_arrow_small(GContext *ctx, GPoint center, int direction_degrees, GColor color) {
+  draw_wind_arrow_ex(ctx, center, direction_degrees, &ARROW_PATH_SMALL, color);
+}
+
+static void draw_wind_arrow_medium(GContext *ctx, GPoint center, int direction_degrees, GColor color) {
+  draw_wind_arrow_ex(ctx, center, direction_degrees, &ARROW_PATH_MEDIUM, color);
+}
+
+// ---------------------------------------------------------------------
+// MAIN window
+// ---------------------------------------------------------------------
+
+static void main_arrow_update_proc(Layer *layer, GContext *ctx) {
   if (!s_has_data) return;
-  GRect b = layer_get_bounds(layer);
-
-  int col_w = b.size.w / 2;
-  int row_h = b.size.h / 3;
-  int border = 2;
-
-  static const char *labels[3][2] = {
-    {"PM2.5 ug/m3", "PM10 ug/m3"},
-    {"NO2 ug/m3", "O3 ug/m3"},
-    {"Temp C", "UV Index"}
-  };
-
-  char values[3][2][12];
-  fmt_int(values[0][0], sizeof(values[0][0]), s_current.pm25);
-  fmt_int(values[0][1], sizeof(values[0][1]), s_current.pm10);
-  fmt_int(values[1][0], sizeof(values[1][0]), s_current.no2);
-  fmt_int(values[1][1], sizeof(values[1][1]), s_current.o3);
-  fmt_int(values[2][0], sizeof(values[2][0]), s_current.temp);
-  fmt_uv(values[2][1], sizeof(values[2][1]), s_current.uv10);
-
-  GColor bg[3][2] = {
-    { eaqi_to_bg_color(s_current.aqi_pm25), eaqi_to_bg_color(s_current.aqi_pm10) },
-    { eaqi_to_bg_color(s_current.aqi_no2), eaqi_to_bg_color(s_current.aqi_o3) },
-    { GColorWhite, GColorWhite } // Temperature & UV: no colour coding
-  };
-  GColor fg[3][2] = {
-    { eaqi_to_fg_color(s_current.aqi_pm25), eaqi_to_fg_color(s_current.aqi_pm10) },
-    { eaqi_to_fg_color(s_current.aqi_no2), eaqi_to_fg_color(s_current.aqi_o3) },
-    { GColorBlack, GColorBlack }
-  };
-
-  GFont label_candidates[3] = {
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_09) // no 09_BOLD exists in the system font set
-  };
-  GFont value_candidates[3] = {
-    fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
-  };
-
-  for (int i = 0; i < 3; i++) {
-    for (int c = 0; c < 2; c++) {
-      GRect cell = GRect(c * col_w + border, i * row_h + border,
-                          col_w - 2 * border, row_h - 2 * border);
-
-      graphics_context_set_fill_color(ctx, bg[i][c]);
-      graphics_fill_rect(ctx, cell, 0, GCornerNone);
-
-      int label_h = (cell.size.h * 2) / 5;
-      GRect label_box = GRect(cell.origin.x, cell.origin.y, cell.size.w, label_h);
-      GRect value_box = GRect(cell.origin.x, cell.origin.y + label_h, cell.size.w, cell.size.h - label_h);
-
-      GFont lf = pick_fit_font(labels[i][c], cell.size.w - 4, label_candidates, 3);
-      GFont vf = pick_fit_font(values[i][c], cell.size.w - 4, value_candidates, 3);
-
-      graphics_context_set_text_color(ctx, fg[i][c]);
-      draw_centered_text(ctx, labels[i][c], lf, label_box);
-      draw_centered_text(ctx, values[i][c], vf, value_box);
-    }
+  GRect bounds = layer_get_bounds(layer);
+  GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
+  if (bounds.size.w >= 36) {
+    draw_wind_arrow_medium(ctx, center, s_rows[0].dir, GColorBlack);
+  } else {
+    draw_wind_arrow_small(ctx, center, s_rows[0].dir, GColorBlack);
   }
+}
+
+static void location_layer_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  // Text is drawn into a much wider box than the layer itself; Pebble clips
+  // all drawing to the layer's own bounds automatically, so shifting the
+  // box left (negative x) progressively reveals more of the tail end while
+  // everything outside stays invisible - this is what makes the scroll work.
+  graphics_draw_text(ctx, s_location_name, s_location_font,
+                      GRect(-s_location_scroll_offset, 0, bounds.size.w + 400, bounds.size.h),
+                      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+}
+
+static void location_scroll_timer_callback(void *data) {
+  if (s_location_scroll_forward) {
+    s_location_scroll_offset += 1;
+    if (s_location_scroll_offset >= s_location_scroll_max) {
+      s_location_scroll_offset = s_location_scroll_max;
+      layer_mark_dirty(s_location_layer);
+      s_location_scroll_forward = false; // now just waiting out the pause before snapping back
+      s_location_scroll_timer = app_timer_register(LOCATION_SCROLL_PAUSE_MS, location_scroll_timer_callback, NULL);
+      return;
+    }
+    layer_mark_dirty(s_location_layer);
+    s_location_scroll_timer = app_timer_register(LOCATION_SCROLL_STEP_MS, location_scroll_timer_callback, NULL);
+  } else {
+    // Pause is over - snap straight back to the start, no animated return.
+    s_location_scroll_offset = 0;
+    layer_mark_dirty(s_location_layer);
+    s_location_scroll_timer = NULL;
+  }
+}
+
+// Starts a single scroll-right-then-back cycle revealing the full location
+// name once, then resets to the normal (possibly clipped) resting position.
+// Callable both automatically after a fresh fetch and independently (e.g.
+// from a touch tap) without needing a data refresh.
+static void trigger_location_scroll(void) {
+  if (!s_location_layer) return;
+
+  GRect bounds = layer_get_bounds(s_location_layer);
+  GSize content_size = graphics_text_layout_get_content_size(
+      s_location_name, s_location_font, GRect(0, 0, 1000, bounds.size.h + 10),
+      GTextOverflowModeFill, GTextAlignmentLeft);
+  int overflow = content_size.w - bounds.size.w;
+  s_location_scroll_max = overflow > 0 ? overflow : 0;
+
+  if (s_location_scroll_timer) {
+    app_timer_cancel(s_location_scroll_timer);
+    s_location_scroll_timer = NULL;
+  }
+
+  s_location_scroll_offset = 0;
+  layer_mark_dirty(s_location_layer);
+
+  if (s_location_scroll_max <= 0) {
+    return; // text already fits fully - nothing to scroll
+  }
+
+  s_location_scroll_forward = true;
+  s_location_scroll_timer = app_timer_register(LOCATION_SCROLL_STEP_MS, location_scroll_timer_callback, NULL);
+}
+
+#if defined(PBL_TOUCH)
+static void main_touch_handler(const TouchEvent *event, void *context) {
+  if (event->type != TouchEvent_Touchdown) return;
+  if (!s_location_layer) return;
+
+  GRect frame = layer_get_frame(s_location_layer);
+  GPoint p = GPoint(event->x, event->y);
+  if (grect_contains_point(&frame, &p)) {
+    trigger_location_scroll();
+  }
+}
+#endif
+
+static void main_window_appear(Window *window) {
+#if defined(PBL_TOUCH)
+  if (touch_service_is_enabled()) {
+    touch_service_subscribe(main_touch_handler, NULL);
+  }
+#endif
+}
+
+static void main_window_disappear(Window *window) {
+#if defined(PBL_TOUCH)
+  touch_service_unsubscribe();
+#endif
 }
 
 static void refresh_main_window(void) {
   if (!s_location_layer) return; // main window not currently loaded
 
-  text_layer_set_text(s_location_layer, s_location_name);
+  layer_mark_dirty(s_location_layer);
 
   if (!s_has_data) {
     text_layer_set_text(s_main_status_layer, s_status_text);
     layer_set_hidden(text_layer_get_layer(s_main_status_layer), false);
-    layer_set_hidden(s_grid_layer, true);
-    text_layer_set_text(s_eaqi_layer, "");
-    text_layer_set_background_color(s_eaqi_layer, GColorClear);
     return;
   }
   layer_set_hidden(text_layer_get_layer(s_main_status_layer), true);
-  layer_set_hidden(s_grid_layer, false);
-  layer_mark_dirty(s_grid_layer);
 
-  static char eaqi_buf[24];
-  snprintf(eaqi_buf, sizeof(eaqi_buf), "EAQI: %s", eaqi_to_label(s_current.aqi_overall));
+  ForecastRow *now = &s_rows[0];
+  const char *unit = WIND_UNIT_SUFFIX[s_wind_unit];
+  snprintf(s_val_10m_buf, sizeof(s_val_10m_buf), "%d %s", now->wind10, unit);
+  snprintf(s_val_gusts_buf, sizeof(s_val_gusts_buf), "%d %s", now->gusts, unit);
+  snprintf(s_val_100m_buf, sizeof(s_val_100m_buf), "%d %s", now->wind100, unit);
 
-  GRect eaqi_bounds = layer_get_bounds(text_layer_get_layer(s_eaqi_layer));
-  GFont eaqi_candidates[3] = {
-    fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD)
-  };
-  GFont eaqi_font = pick_fit_font(eaqi_buf, eaqi_bounds.size.w - 4, eaqi_candidates, 3);
-  text_layer_set_font(s_eaqi_layer, eaqi_font);
-  text_layer_set_text(s_eaqi_layer, eaqi_buf);
-  text_layer_set_background_color(s_eaqi_layer, eaqi_to_bg_color(s_current.aqi_overall));
-  text_layer_set_text_color(s_eaqi_layer, eaqi_to_fg_color(s_current.aqi_overall));
+  text_layer_set_text(s_val_10m_layer, s_val_10m_buf);
+  text_layer_set_text(s_val_gusts_layer, s_val_gusts_buf);
+  text_layer_set_text(s_val_100m_layer, s_val_100m_buf);
+
+  text_layer_set_text_color(s_val_10m_layer, color_for_value(now->wind10));
+  text_layer_set_text_color(s_val_gusts_layer, color_for_value(now->gusts));
+  text_layer_set_text_color(s_val_100m_layer, color_for_value(now->wind100));
+
+  text_layer_set_text(s_lbl_100m_layer, s_model_type == 1 ? "At 100m:" : "At 120m:");
+
+  layer_mark_dirty(s_main_arrow_layer);
 }
 
 static void main_up_click(ClickRecognizerRef recognizer, void *context) {
@@ -435,7 +436,7 @@ static void main_down_click(ClickRecognizerRef recognizer, void *context) {
 }
 
 static void main_select_click(ClickRecognizerRef recognizer, void *context) {
-  request_data();
+  request_forecast();
 }
 
 static void main_click_config_provider(void *context) {
@@ -447,7 +448,8 @@ static void main_click_config_provider(void *context) {
 static void main_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
-  int content_width = bounds.size.w - ACTION_BAR_WIDTH;
+  int content_width = bounds.size.w - ACTIONBAR_ICON_WIDTH;
+  bool compact = bounds.size.h < 200;
 
   s_action_bar = action_bar_layer_create();
   action_bar_layer_add_to_window(s_action_bar, window);
@@ -462,233 +464,259 @@ static void main_window_load(Window *window) {
   action_bar_layer_set_icon(s_action_bar, BUTTON_ID_DOWN, s_icon_list_forecast);
   action_bar_layer_set_icon(s_action_bar, BUTTON_ID_SELECT, s_icon_refresh);
 
-  int loc_h = 30; // was 26 - a few extra px so the location text stops clipping at the bottom
-  int eaqi_h = 26; // same size as location, per request
+  // Fonts stay at (or very close to) their original sizes - the built-in
+  // font ladder doesn't offer a clean 10-20% step, so compact screens keep
+  // the original size exactly and only the roomier tier gets a small nudge.
+  GFont font_location = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_18_BOLD : FONT_KEY_GOTHIC_28_BOLD);
+  GFont font_label    = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14_BOLD : FONT_KEY_GOTHIC_18_BOLD);
+  GFont font_value    = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_28_BOLD : FONT_KEY_BITHAM_30_BLACK);
 
-  s_location_layer = text_layer_create(GRect(4, 0, content_width - 8, loc_h));
-  text_layer_set_font(s_location_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
-  text_layer_set_text_alignment(s_location_layer, GTextAlignmentCenter);
-  text_layer_set_text(s_location_layer, s_location_name);
-  layer_add_child(window_layer, text_layer_get_layer(s_location_layer));
+  int loc_h      = compact ? 20 : 34;
+  int label_h    = compact ? 16 : 18;
+  int value_h    = compact ? 28 : 36;
+  int gap        = compact ? 0 : 1;
+  int arrow_size = compact ? 28 : 40;
 
-  s_grid_layer = layer_create(GRect(0, loc_h, content_width, bounds.size.h - loc_h - eaqi_h));
-  layer_set_update_proc(s_grid_layer, main_grid_update_proc);
-  layer_add_child(window_layer, s_grid_layer);
+  s_location_font = font_location;
+  s_location_layer = layer_create(GRect(4, 0, content_width - 8, loc_h));
+  layer_set_update_proc(s_location_layer, location_layer_update_proc);
+  layer_add_child(window_layer, s_location_layer);
 
-  s_eaqi_layer = text_layer_create(GRect(4, bounds.size.h - eaqi_h, content_width - 8, eaqi_h));
-  text_layer_set_font(s_eaqi_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
-  text_layer_set_text_alignment(s_eaqi_layer, GTextAlignmentCenter);
-  text_layer_set_text(s_eaqi_layer, "");
-  layer_add_child(window_layer, text_layer_get_layer(s_eaqi_layer));
+  int y = loc_h + gap;
+
+  // Direction arrow sits inline on the same row as "At 10m:" rather than
+  // overlapping the location name above it - avoids any cutoff.
+  int row1_h = arrow_size > label_h ? arrow_size : label_h;
+  int label_y_offset = row1_h - label_h; // align label to bottom within the taller row
+
+  s_lbl_10m_layer = text_layer_create(GRect(4, y + label_y_offset, content_width - arrow_size - 12, label_h));
+  text_layer_set_font(s_lbl_10m_layer, font_label);
+  text_layer_set_text(s_lbl_10m_layer, "At 10m:");
+  layer_add_child(window_layer, text_layer_get_layer(s_lbl_10m_layer));
+
+  s_main_arrow_layer = layer_create(GRect(content_width - arrow_size - 4, y, arrow_size, arrow_size));
+  layer_set_update_proc(s_main_arrow_layer, main_arrow_update_proc);
+  layer_add_child(window_layer, s_main_arrow_layer);
+  y += row1_h;
+
+  s_val_10m_layer = text_layer_create(GRect(4, y, content_width - 8, value_h));
+  text_layer_set_font(s_val_10m_layer, font_value);
+  text_layer_set_text_alignment(s_val_10m_layer, GTextAlignmentCenter);
+  layer_add_child(window_layer, text_layer_get_layer(s_val_10m_layer));
+  y += value_h + gap;
+
+  s_lbl_gusts_layer = text_layer_create(GRect(4, y, content_width - 8, label_h));
+  text_layer_set_font(s_lbl_gusts_layer, font_label);
+  text_layer_set_text(s_lbl_gusts_layer, "Gusts:");
+  layer_add_child(window_layer, text_layer_get_layer(s_lbl_gusts_layer));
+  y += label_h;
+
+  s_val_gusts_layer = text_layer_create(GRect(4, y, content_width - 8, value_h));
+  text_layer_set_font(s_val_gusts_layer, font_value);
+  text_layer_set_text_alignment(s_val_gusts_layer, GTextAlignmentCenter);
+  layer_add_child(window_layer, text_layer_get_layer(s_val_gusts_layer));
+  y += value_h + gap;
+
+  s_lbl_100m_layer = text_layer_create(GRect(4, y, content_width - 8, label_h));
+  text_layer_set_font(s_lbl_100m_layer, font_label);
+  text_layer_set_text(s_lbl_100m_layer, "At 120m:");
+  layer_add_child(window_layer, text_layer_get_layer(s_lbl_100m_layer));
+  y += label_h;
+
+  s_val_100m_layer = text_layer_create(GRect(4, y, content_width - 8, value_h));
+  text_layer_set_font(s_val_100m_layer, font_value);
+  text_layer_set_text_alignment(s_val_100m_layer, GTextAlignmentCenter);
+  layer_add_child(window_layer, text_layer_get_layer(s_val_100m_layer));
 
   s_main_status_layer = text_layer_create(GRect(0, bounds.size.h / 2 - 20, content_width, 40));
   text_layer_set_text_alignment(s_main_status_layer, GTextAlignmentCenter);
-  text_layer_set_font(s_main_status_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_main_status_layer, fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14 : FONT_KEY_GOTHIC_18));
   text_layer_set_text(s_main_status_layer, s_status_text);
   layer_add_child(window_layer, text_layer_get_layer(s_main_status_layer));
 
   refresh_main_window();
+  trigger_location_scroll();
 }
 
 static void main_window_unload(Window *window) {
+  if (s_location_scroll_timer) {
+    app_timer_cancel(s_location_scroll_timer);
+    s_location_scroll_timer = NULL;
+  }
+#if defined(PBL_TOUCH)
+  touch_service_unsubscribe();
+#endif
+
   action_bar_layer_destroy(s_action_bar);
   gbitmap_destroy(s_icon_graph);
   gbitmap_destroy(s_icon_list_forecast);
   gbitmap_destroy(s_icon_refresh);
-  text_layer_destroy(s_location_layer);
-  layer_destroy(s_grid_layer);
-  text_layer_destroy(s_eaqi_layer);
+  layer_destroy(s_location_layer);
+  text_layer_destroy(s_lbl_10m_layer);
+  text_layer_destroy(s_val_10m_layer);
+  text_layer_destroy(s_lbl_gusts_layer);
+  text_layer_destroy(s_val_gusts_layer);
+  text_layer_destroy(s_lbl_100m_layer);
+  text_layer_destroy(s_val_100m_layer);
   text_layer_destroy(s_main_status_layer);
+  layer_destroy(s_main_arrow_layer);
 
   s_location_layer = NULL;
-  s_grid_layer = NULL;
-  s_eaqi_layer = NULL;
+  s_main_arrow_layer = NULL;
   s_main_status_layer = NULL;
 }
 
 // ---------------------------------------------------------------------
-// FORECAST window - sticky header + scrolling list, narrow time column
+// FORECAST window (no action bar - Back button returns to main)
 // ---------------------------------------------------------------------
 
-static int forecast_col_x(int window_width, int col_index) {
-  int value_area = window_width - TIME_COL_W;
-  int col_w = value_area / 4;
-  return TIME_COL_W + col_index * col_w;
+static uint16_t forecast_get_num_rows(MenuLayer *menu_layer, uint16_t section_index, void *context) {
+  return s_row_count;
 }
 
-static int forecast_col_w(int window_width) {
-  int value_area = window_width - TIME_COL_W;
-  return value_area / 4;
+static int16_t forecast_get_row_height(MenuLayer *menu_layer, MenuIndex *cell_index, void *context) {
+  return 26;
 }
 
-static void forecast_header_update_proc(Layer *layer, GContext *ctx) {
-  GRect b = layer_get_bounds(layer);
-  static const char *headers[4] = {"PM2.5", "PM10", "NO2", "O3"};
-  int col_w = forecast_col_w(b.size.w);
+static void forecast_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_index, void *context) {
+  if (cell_index->row >= (uint16_t)s_row_count) return;
+  ForecastRow *r = &s_rows[cell_index->row];
+  GRect bounds = layer_get_bounds(cell_layer);
+  bool compact = bounds.size.w < 180;
 
-  // Try the biggest font first; only use it if every label still fits its
-  // column at that size, so a short label like "O3" doesn't force a size
-  // too big for "PM2.5" to fit.
-  GFont header_candidates[2] = {
-    fonts_get_system_font(FONT_KEY_GOTHIC_14),
-    fonts_get_system_font(FONT_KEY_GOTHIC_09)
-  };
-  GFont font = header_candidates[1];
-  for (int f = 0; f < 2; f++) {
-    bool all_fit = true;
-    for (int i = 0; i < 4; i++) {
-      GSize sz = graphics_text_layout_get_content_size(headers[i], header_candidates[f],
-                                                         GRect(0, 0, 500, 30),
-                                                         GTextOverflowModeFill, GTextAlignmentLeft);
-      if (sz.w > col_w - 4) { all_fit = false; break; }
-    }
-    if (all_fit) { font = header_candidates[f]; break; }
-  }
-
-  graphics_context_set_fill_color(ctx, GColorLightGray);
-  graphics_fill_rect(ctx, b, 0, GCornerNone);
-
-  graphics_context_set_text_color(ctx, GColorBlack);
-  for (int i = 0; i < 4; i++) {
-    GRect cell = GRect(forecast_col_x(b.size.w, i), 0, col_w, b.size.h);
-    draw_centered_text(ctx, headers[i], font, cell);
-  }
-
-  graphics_context_set_stroke_color(ctx, GColorDarkGray);
-  graphics_draw_line(ctx, GPoint(0, b.size.h - 1), GPoint(b.size.w, b.size.h - 1));
-}
-
-// Draws one forecast row at a fixed y-offset within the scrollable content
-// layer. No highlight/selection concept here - ScrollLayer just scrolls, it
-// doesn't have MenuLayer's row-selection styling to fight with.
-static void draw_forecast_row(GContext *ctx, int row_index, int y, int width) {
-  ForecastRow *r = &s_rows[row_index];
-  GRect bounds = GRect(0, y, width, ROW_HEIGHT);
-
-  GFont time_font = fonts_get_system_font(FONT_KEY_GOTHIC_18);
+  GFont time_font  = fonts_get_system_font(FONT_KEY_GOTHIC_18);
   GFont value_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 
-  graphics_context_set_fill_color(ctx, GColorWhite);
+  bool highlighted = menu_cell_layer_is_highlighted(cell_layer);
+  bool gust_warning = r->gusts > red_threshold();
+
+  GColor bg_color = highlighted ? GColorBlack : (gust_warning ? GColorDarkCandyAppleRed : GColorWhite);
+  GColor fg_color = (highlighted || gust_warning) ? GColorWhite : GColorBlack;
+
+  // Explicit background fill - do not rely solely on the framework's
+  // automatic highlight background, since we're fully custom-drawing this row.
+  graphics_context_set_fill_color(ctx, bg_color);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
-  char hour_buf[6], v[4][6];
-  snprintf(hour_buf, sizeof(hour_buf), "%02d:00", r->hour);
-  fmt_int(v[0], sizeof(v[0]), r->pm25);
-  fmt_int(v[1], sizeof(v[1]), r->pm10);
-  fmt_int(v[2], sizeof(v[2]), r->no2);
-  fmt_int(v[3], sizeof(v[3]), r->o3);
-
-  graphics_context_set_text_color(ctx, GColorBlack);
-  draw_centered_text(ctx, hour_buf, time_font, GRect(0, y, TIME_COL_W, ROW_HEIGHT));
-
-  int col_w = forecast_col_w(width);
-  for (int i = 0; i < 4; i++) {
-    GRect cell = GRect(forecast_col_x(width, i), y, col_w, ROW_HEIGHT);
-    draw_centered_text(ctx, v[i], value_font, cell);
+  char hour_buf[8], w10_buf[6], gust_buf[6], w100_buf[6];
+  if (compact) {
+    snprintf(hour_buf, sizeof(hour_buf), "%d", r->hour);
+  } else {
+    snprintf(hour_buf, sizeof(hour_buf), "%02d:00", r->hour);
   }
+  snprintf(w10_buf, sizeof(w10_buf), "%d", r->wind10);
+  snprintf(gust_buf, sizeof(gust_buf), "%d", r->gusts);
+  snprintf(w100_buf, sizeof(w100_buf), "%d", r->wind100);
 
-  graphics_context_set_stroke_color(ctx, GColorLightGray);
-  graphics_draw_line(ctx, GPoint(0, y + ROW_HEIGHT - 1), GPoint(width, y + ROW_HEIGHT - 1));
-}
+  graphics_context_set_text_color(ctx, fg_color);
 
-static void forecast_content_update_proc(Layer *layer, GContext *ctx) {
-  GRect b = layer_get_bounds(layer);
-  for (int i = 0; i < s_row_count; i++) {
-    draw_forecast_row(ctx, i, i * ROW_HEIGHT, b.size.w);
+  if (compact) {
+    graphics_draw_text(ctx, hour_buf, time_font, GRect(2, 2, 30, bounds.size.h),
+                        GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+    draw_wind_arrow_small(ctx, GPoint(38, bounds.size.h / 2), r->dir, fg_color);
+    graphics_draw_text(ctx, w10_buf, value_font, GRect(50, 2, 30, bounds.size.h),
+                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+    graphics_draw_text(ctx, gust_buf, value_font, GRect(82, 2, 30, bounds.size.h),
+                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+    graphics_draw_text(ctx, w100_buf, value_font, GRect(114, 2, 28, bounds.size.h),
+                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  } else {
+    graphics_draw_text(ctx, hour_buf, time_font, GRect(4, 3, 50, bounds.size.h),
+                        GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+    draw_wind_arrow_medium(ctx, GPoint(62, bounds.size.h / 2), r->dir, fg_color);
+    graphics_draw_text(ctx, w10_buf, value_font, GRect(78, 3, 40, bounds.size.h),
+                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+    graphics_draw_text(ctx, gust_buf, value_font, GRect(120, 3, 40, bounds.size.h),
+                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+    graphics_draw_text(ctx, w100_buf, value_font, GRect(162, 3, 34, bounds.size.h),
+                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   }
 }
 
-// Clamp a ScrollLayer's content offset to its valid [min, 0] range. Needed
-// because we set the offset directly from touch deltas rather than only
-// ever nudging it by a known-safe button-scroll increment.
-static void clamp_scroll_offset(void) {
-  GRect frame = layer_get_bounds(scroll_layer_get_layer(s_scroll_layer));
-  GSize content = scroll_layer_get_content_size(s_scroll_layer);
-  int min_y = frame.size.h - content.h;
-  if (min_y > 0) min_y = 0;
-
-  GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
-  if (offset.y > 0) offset.y = 0;
-  if (offset.y < min_y) offset.y = min_y;
-  scroll_layer_set_content_offset(s_scroll_layer, offset, false);
-}
+#if defined(PBL_TOUCH)
+static int s_forecast_touch_start_y;
+static GPoint s_forecast_touch_start_offset;
+static bool s_forecast_touch_dragging = false;
 
 static void forecast_touch_handler(const TouchEvent *event, void *context) {
+  if (!s_menu_layer) return;
+  ScrollLayer *scroll_layer = menu_layer_get_scroll_layer(s_menu_layer);
+
   switch (event->type) {
     case TouchEvent_Touchdown:
-      s_touch_last_point = GPoint(event->x, event->y);
+      s_forecast_touch_start_y = event->y;
+      s_forecast_touch_start_offset = scroll_layer_get_content_offset(scroll_layer);
+      s_forecast_touch_dragging = true;
       break;
-    case TouchEvent_PositionUpdate: {
-      int dy = event->y - s_touch_last_point.y;
-      GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
-      offset.y += dy;
-      scroll_layer_set_content_offset(s_scroll_layer, offset, false);
-      clamp_scroll_offset();
-      s_touch_last_point = GPoint(event->x, event->y);
+    case TouchEvent_PositionUpdate:
+      if (s_forecast_touch_dragging) {
+        int delta = event->y - s_forecast_touch_start_y;
+        GPoint new_offset = GPoint(s_forecast_touch_start_offset.x, s_forecast_touch_start_offset.y + delta);
+        scroll_layer_set_content_offset(scroll_layer, new_offset, false);
+      }
       break;
-    }
     case TouchEvent_Liftoff:
-    default:
+      s_forecast_touch_dragging = false;
       break;
   }
+}
+#endif
+
+static void forecast_window_appear(Window *window) {
+#if defined(PBL_TOUCH)
+  if (touch_service_is_enabled()) {
+    touch_service_subscribe(forecast_touch_handler, NULL);
+  }
+#endif
+}
+
+static void forecast_window_disappear(Window *window) {
+#if defined(PBL_TOUCH)
+  touch_service_unsubscribe();
+#endif
 }
 
 static void forecast_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
+  bool compact = bounds.size.w < 180;
 
-  s_forecast_header_layer = layer_create(GRect(0, 0, bounds.size.w, HEADER_HEIGHT));
-  layer_set_update_proc(s_forecast_header_layer, forecast_header_update_proc);
-  layer_add_child(window_layer, s_forecast_header_layer);
-  layer_set_hidden(s_forecast_header_layer, !s_has_data);
-
-  // Scroll area sits below the fixed header, so scrolled rows disappear underneath it.
-  GRect scroll_bounds = GRect(0, HEADER_HEIGHT, bounds.size.w, bounds.size.h - HEADER_HEIGHT);
-  s_scroll_layer = scroll_layer_create(scroll_bounds);
-  scroll_layer_set_click_config_onto_window(s_scroll_layer, window); // keeps UP/DOWN button scrolling
-
-  int content_h = s_row_count * ROW_HEIGHT;
-  if (content_h < scroll_bounds.size.h) content_h = scroll_bounds.size.h;
-  scroll_layer_set_content_size(s_scroll_layer, GSize(scroll_bounds.size.w, content_h));
-
-  s_forecast_content_layer = layer_create(GRect(0, 0, scroll_bounds.size.w, content_h));
-  layer_set_update_proc(s_forecast_content_layer, forecast_content_update_proc);
-  scroll_layer_add_child(s_scroll_layer, s_forecast_content_layer);
-
-  layer_add_child(window_layer, scroll_layer_get_layer(s_scroll_layer));
-  layer_set_hidden(scroll_layer_get_layer(s_scroll_layer), !s_has_data);
-
-  // Touch-drag scrolling: only real on Emery hardware, but harmless to
-  // subscribe anywhere - it's simply a no-op on platforms without a
-  // touchscreen (touch_service_is_enabled() would return false there).
-  if (touch_service_is_enabled()) {
-    touch_service_subscribe(forecast_touch_handler, NULL);
-  }
+  s_menu_layer = menu_layer_create(bounds);
+  menu_layer_set_callbacks(s_menu_layer, NULL, (MenuLayerCallbacks) {
+    .get_num_rows = forecast_get_num_rows,
+    .get_cell_height = forecast_get_row_height,
+    .draw_row = forecast_draw_row,
+  });
+  menu_layer_set_click_config_onto_window(s_menu_layer, window);
+  menu_layer_set_highlight_colors(s_menu_layer, GColorBlack, GColorWhite);
+  layer_add_child(window_layer, menu_layer_get_layer(s_menu_layer));
+  layer_set_hidden(menu_layer_get_layer(s_menu_layer), !s_has_data);
 
   s_forecast_status_layer = text_layer_create(GRect(0, bounds.size.h / 2 - 20, bounds.size.w, 40));
   text_layer_set_text_alignment(s_forecast_status_layer, GTextAlignmentCenter);
-  text_layer_set_font(s_forecast_status_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_forecast_status_layer, fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14 : FONT_KEY_GOTHIC_18));
   text_layer_set_text(s_forecast_status_layer, s_has_data ? "" : s_status_text);
   layer_set_hidden(text_layer_get_layer(s_forecast_status_layer), s_has_data);
   layer_add_child(window_layer, text_layer_get_layer(s_forecast_status_layer));
 }
 
 static void forecast_window_unload(Window *window) {
+#if defined(PBL_TOUCH)
   touch_service_unsubscribe();
-  layer_destroy(s_forecast_content_layer);
-  scroll_layer_destroy(s_scroll_layer);
-  layer_destroy(s_forecast_header_layer);
+#endif
+  menu_layer_destroy(s_menu_layer);
   text_layer_destroy(s_forecast_status_layer);
-  s_forecast_content_layer = NULL;
-  s_scroll_layer = NULL;
-  s_forecast_header_layer = NULL;
+  s_menu_layer = NULL;
   s_forecast_status_layer = NULL;
 }
 
 // ---------------------------------------------------------------------
-// GRAPH window - 12h Birch/Grass pollen graph with dynamic Y scale
+// GRAPH window (no action bar - Back button returns to main)
 // ---------------------------------------------------------------------
 
+// Draws a straight line as a series of short dashes rather than solid -
+// integer-only math (no sqrt/float), splits the segment into num_dashes
+// evenly-spaced dash/gap pairs regardless of segment length.
 static void draw_dashed_line(GContext *ctx, GPoint p1, GPoint p2, int num_dashes) {
   for (int i = 0; i < num_dashes; i++) {
     int x1 = p1.x + (p2.x - p1.x) * i / num_dashes;
@@ -699,37 +727,25 @@ static void draw_dashed_line(GContext *ctx, GPoint p1, GPoint p2, int num_dashes
   }
 }
 
-// Picks a "nice" axis step (1/2/5 x10^n) so the range fits in ~4-5 gridlines.
-static int nice_step(int max_val) {
-  static const int steps[] = {1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000};
-  int n = sizeof(steps) / sizeof(steps[0]);
-  for (int i = 0; i < n; i++) {
-    if (max_val <= steps[i] * 5) return steps[i];
+// Draws a line as small filled dots along its length - visually distinct
+// from both the solid and dashed styles, for the 100m series.
+static void draw_dotted_line(GContext *ctx, GPoint p1, GPoint p2, int num_dots) {
+  for (int i = 0; i <= num_dots; i++) {
+    int x = p1.x + (p2.x - p1.x) * i / num_dots;
+    int y = p1.y + (p2.y - p1.y) * i / num_dots;
+    graphics_fill_circle(ctx, GPoint(x, y), 1);
   }
-  return steps[n - 1];
-}
-
-static void graph_no_season_update_proc(Layer *layer, GContext *ctx) {
-  GRect b = layer_get_bounds(layer);
-  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
-  graphics_context_set_text_color(ctx, GColorBlack);
-  draw_centered_text(ctx, "No Pollen data", font, GRect(0, b.size.h / 2 - 24, b.size.w, 24));
-  draw_centered_text(ctx, "available at this time", font, GRect(0, b.size.h / 2, b.size.w, 24));
 }
 
 static void graph_update_proc(Layer *layer, GContext *ctx) {
   if (!s_has_data) return;
-
-  if (!s_pollen_season || s_graph_count < 2) {
-    graph_no_season_update_proc(layer, ctx);
-    return;
-  }
-
   GRect bounds = layer_get_bounds(layer);
-  int margin_left = 28;
+  bool compact = bounds.size.w < 180;
+
+  int margin_left = compact ? 22 : 30;
   int margin_top = 6;
-  int hour_label_h = 16;
-  int legend_h = 32; // two lines of legend text
+  int hour_label_h = compact ? 14 : 18;
+  int legend_h = compact ? 18 : 24;
   int margin_bottom = hour_label_h + legend_h;
 
   int plot_w = bounds.size.w - margin_left - 6;
@@ -737,82 +753,93 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
   int origin_x = margin_left;
   int origin_y = margin_top + plot_h;
 
-  int max_val = 1;
-  for (int i = 0; i < s_graph_count; i++) {
-    if (s_graph[i].birch > max_val) max_val = s_graph[i].birch;
-    if (s_graph[i].grass > max_val) max_val = s_graph[i].grass;
-  }
-  int step = nice_step(max_val);
-  int y_max = ((max_val / step) + 1) * step;
-
-  GFont label_font = fonts_get_system_font(FONT_KEY_GOTHIC_09);
-  GFont hour_font = fonts_get_system_font(FONT_KEY_GOTHIC_09);
-  GFont legend_font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  GFont label_font = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_09 : FONT_KEY_GOTHIC_14_BOLD);
+  GFont legend_font = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14_BOLD : FONT_KEY_GOTHIC_18_BOLD);
+  int label_half_h = compact ? 7 : 10;
+  int hour_half_w = compact ? 12 : 18;
+  int hour_w = compact ? 24 : 36;
 
   graphics_context_set_stroke_color(ctx, GColorBlack);
   graphics_draw_line(ctx, GPoint(origin_x, margin_top), GPoint(origin_x, origin_y));
   graphics_draw_line(ctx, GPoint(origin_x, origin_y), GPoint(origin_x + plot_w, origin_y));
 
-  for (int gv = 0; gv <= y_max; gv += step) {
-    int y = origin_y - (gv * plot_h) / y_max;
-    graphics_context_set_stroke_color(ctx, GColorLightGray);
+  const int *marks = current_graph_marks();
+  int y_max = graph_y_max();
+  for (int i = 0; i < 4; i++) {
+    int y = origin_y - (marks[i] * plot_h) / y_max;
+    GColor c = (marks[i] == red_threshold()) ? GColorDarkCandyAppleRed : GColorLightGray;
+    graphics_context_set_stroke_color(ctx, c);
     graphics_draw_line(ctx, GPoint(origin_x, y), GPoint(origin_x + plot_w, y));
 
-    char buf[6];
-    snprintf(buf, sizeof(buf), "%d", gv);
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%d", marks[i]);
     graphics_context_set_text_color(ctx, GColorBlack);
-    graphics_draw_text(ctx, buf, label_font, GRect(0, y - 7, margin_left - 3, 14),
+    graphics_draw_text(ctx, buf, label_font,
+                        GRect(0, y - label_half_h, margin_left - 4, hour_label_h),
                         GTextOverflowModeFill, GTextAlignmentRight, NULL);
   }
 
-  GPoint prev_birch = GPoint(0, 0), prev_grass = GPoint(0, 0);
-  for (int i = 0; i < s_graph_count; i++) {
-    int x = origin_x + (i * plot_w) / (s_graph_count - 1);
+  int points = s_row_count < GRAPH_POINTS ? s_row_count : GRAPH_POINTS;
+  if (points >= 2) {
+    GPoint prev10 = GPoint(0, 0);
+    GPoint prev_gust = GPoint(0, 0);
+    GPoint prev_100 = GPoint(0, 0);
 
-    int vb = s_graph[i].birch > y_max ? y_max : s_graph[i].birch;
-    GPoint pb = GPoint(x, origin_y - (vb * plot_h) / y_max);
+    for (int i = 0; i < points; i++) {
+      int x = origin_x + (i * plot_w) / (points - 1);
 
-    int vg = s_graph[i].grass > y_max ? y_max : s_graph[i].grass;
-    GPoint pg = GPoint(x, origin_y - (vg * plot_h) / y_max);
+      int val10 = s_rows[i].wind10;
+      if (val10 > y_max) val10 = y_max;
+      GPoint p10 = GPoint(x, origin_y - (val10 * plot_h) / y_max);
 
-    if (i > 0) {
-      graphics_context_set_stroke_color(ctx, GColorFromRGB(140, 90, 40)); // Birch - brown, solid
-      graphics_context_set_stroke_width(ctx, 2);
-      graphics_draw_line(ctx, prev_birch, pb);
+      int valg = s_rows[i].gusts;
+      if (valg > y_max) valg = y_max;
+      GPoint pgust = GPoint(x, origin_y - (valg * plot_h) / y_max);
 
-      graphics_context_set_stroke_color(ctx, GColorFromRGB(0, 140, 0)); // Grass - green, dashed
-      graphics_context_set_stroke_width(ctx, 2);
-      draw_dashed_line(ctx, prev_grass, pg, 4);
-    }
+      int val100 = s_rows[i].wind100;
+      if (val100 > y_max) val100 = y_max;
+      GPoint p100 = GPoint(x, origin_y - (val100 * plot_h) / y_max);
 
-    graphics_context_set_fill_color(ctx, GColorFromRGB(140, 90, 40));
-    graphics_fill_circle(ctx, pb, 2);
-    graphics_context_set_fill_color(ctx, GColorFromRGB(0, 140, 0));
-    graphics_fill_circle(ctx, pg, 2);
+      if (i > 0) {
+        graphics_context_set_stroke_color(ctx, GColorBlack);
+        graphics_context_set_stroke_width(ctx, 2);
+        graphics_draw_line(ctx, prev10, p10);
 
-    if (i % 4 == 0) { // thin out hour labels to avoid crowding
+        graphics_context_set_stroke_color(ctx, GColorDarkCandyAppleRed);
+        graphics_context_set_stroke_width(ctx, 3);
+        draw_dashed_line(ctx, prev_gust, pgust, 4);
+
+        graphics_context_set_fill_color(ctx, GColorBlack);
+        draw_dotted_line(ctx, prev_100, p100, 10);
+      }
+
+      graphics_context_set_fill_color(ctx, color_for_value(s_rows[i].wind10));
+      graphics_fill_circle(ctx, p10, 3);
+
       char hbuf[4];
-      snprintf(hbuf, sizeof(hbuf), "%02d", s_graph[i].hour);
+      snprintf(hbuf, sizeof(hbuf), "%02d", s_rows[i].hour);
       graphics_context_set_text_color(ctx, GColorBlack);
-      graphics_draw_text(ctx, hbuf, hour_font, GRect(x - 12, origin_y + 3, 24, hour_label_h),
+      graphics_draw_text(ctx, hbuf, label_font,
+                          GRect(x - hour_half_w, origin_y + 4, hour_w, hour_label_h),
                           GTextOverflowModeFill, GTextAlignmentCenter, NULL);
-    }
 
-    prev_birch = pb;
-    prev_grass = pg;
+      prev10 = p10;
+      prev_gust = pgust;
+      prev_100 = p100;
+    }
   }
 
-  graphics_context_set_text_color(ctx, GColorFromRGB(140, 90, 40));
-  draw_centered_text(ctx, "Birch pollen ----", legend_font,
-                      GRect(0, bounds.size.h - legend_h, bounds.size.w, legend_h / 2));
-  graphics_context_set_text_color(ctx, GColorFromRGB(0, 140, 0));
-  draw_centered_text(ctx, "Grass pollen - - -", legend_font,
-                      GRect(0, bounds.size.h - legend_h / 2, bounds.size.w, legend_h / 2));
+  // Legend line at the very bottom explaining which line style is which.
+  graphics_context_set_text_color(ctx, GColorBlack);
+  graphics_draw_text(ctx, "10m—— Gusts--- 120m……", legend_font,
+                      GRect(0, bounds.size.h - legend_h, bounds.size.w, legend_h),
+                      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
 
 static void graph_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
+  bool compact = bounds.size.w < 180;
 
   s_graph_layer = layer_create(bounds);
   layer_set_update_proc(s_graph_layer, graph_update_proc);
@@ -821,7 +848,7 @@ static void graph_window_load(Window *window) {
 
   s_graph_status_layer = text_layer_create(GRect(0, bounds.size.h / 2 - 20, bounds.size.w, 40));
   text_layer_set_text_alignment(s_graph_status_layer, GTextAlignmentCenter);
-  text_layer_set_font(s_graph_status_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_graph_status_layer, fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14 : FONT_KEY_GOTHIC_18));
   text_layer_set_text(s_graph_status_layer, s_has_data ? "" : s_status_text);
   layer_set_hidden(text_layer_get_layer(s_graph_status_layer), s_has_data);
   layer_add_child(window_layer, text_layer_get_layer(s_graph_status_layer));
@@ -839,19 +866,20 @@ static void graph_window_unload(Window *window) {
 // ---------------------------------------------------------------------
 
 static void init(void) {
-  s_current.aqi_pm25 = s_current.aqi_pm10 = s_current.aqi_no2 = s_current.aqi_o3 = -1;
-  s_current.aqi_overall = -1;
-
   s_main_window = window_create();
   window_set_window_handlers(s_main_window, (WindowHandlers) {
     .load = main_window_load,
     .unload = main_window_unload,
+    .appear = main_window_appear,
+    .disappear = main_window_disappear,
   });
 
   s_forecast_window = window_create();
   window_set_window_handlers(s_forecast_window, (WindowHandlers) {
     .load = forecast_window_load,
     .unload = forecast_window_unload,
+    .appear = forecast_window_appear,
+    .disappear = forecast_window_disappear,
   });
 
   s_graph_window = window_create();
@@ -866,7 +894,7 @@ static void init(void) {
   app_message_open(app_message_inbox_size_maximum(), app_message_outbox_size_maximum());
 
   window_stack_push(s_main_window, true);
-  request_data();
+  request_forecast();
 }
 
 static void deinit(void) {
