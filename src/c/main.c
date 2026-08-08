@@ -9,6 +9,7 @@
 #define HEADER_HEIGHT 22
 #define ROW_HEIGHT 26
 #define TIME_COL_W 54
+#define POLLEN_BOX_HEIGHT 30
 
 typedef struct {
   int hour;
@@ -17,7 +18,7 @@ typedef struct {
 
 typedef struct {
   int hour;
-  int birch, grass; // grains/m3
+  int trees, grass, weeds; // grains/m3, summed per category
 } GraphPoint;
 
 typedef struct {
@@ -31,7 +32,17 @@ static int s_row_count = 0;
 static GraphPoint s_graph[GRAPH_POINTS];
 static int s_graph_count = 0;
 static bool s_pollen_season = false;
+// Category totals (grains/m3, sum of species per group), NO_DATA if every
+// species in that group came back null. Trees = Alder+Birch+Olive,
+// Weeds = Mugwort+Ragweed, Grass = Grass (only one species).
+static int s_pollen_trees = NO_DATA;
+static int s_pollen_grass = NO_DATA;
+static int s_pollen_weeds = NO_DATA;
 static CurrentData s_current;
+// EAQI box content/colour, read by eaqi_box_update_proc at draw time.
+static char s_eaqi_text[24] = "";
+static GColor s_eaqi_bg = GColorClear;
+static GColor s_eaqi_fg = GColorBlack;
 static char s_location_name[32] = "Locating...";
 static char s_status_text[48] = "Fetching air quality...";
 static bool s_has_data = false;
@@ -47,7 +58,7 @@ static GBitmap *s_icon_graph;
 static GBitmap *s_icon_list_forecast;
 static GBitmap *s_icon_refresh;
 static TextLayer *s_location_layer;
-static TextLayer *s_eaqi_layer;
+static Layer *s_eaqi_layer;
 static Layer *s_grid_layer;
 static TextLayer *s_main_status_layer;
 
@@ -61,8 +72,10 @@ static TextLayer *s_forecast_status_layer;
 // --- Graph window widgets ---
 static Layer *s_graph_layer;
 static TextLayer *s_graph_status_layer;
+static TextLayer *s_pollen_box_layer;
 
 static void refresh_main_window(void);
+static void refresh_pollen_box(void);
 
 // ---------------------------------------------------------------------
 // Colour mapping - European AQI sub-index -> background colour
@@ -94,6 +107,57 @@ static const char *eaqi_to_label(int aqi) {
 }
 
 // ---------------------------------------------------------------------
+// Pollen category tiers (Trees/Grass/Weeds) - thresholds from Kleenex/
+// Ambee's public pollen risk table (grains/m3), NOT from Open-Meteo
+// itself. Each category has its own distinct cutoffs, unlike EAQI which
+// uses one universal scale for every pollutant.
+// ---------------------------------------------------------------------
+
+typedef enum { POLLEN_TREES, POLLEN_GRASS, POLLEN_WEEDS } PollenCategory;
+
+// Returns 0=Low, 1=Moderate, 2=High, 3=Very High, or -1 for no data.
+static int pollen_tier(int value, PollenCategory cat) {
+  if (value < 0) return -1;
+
+  int low_max, moderate_max, high_max;
+  switch (cat) {
+    case POLLEN_TREES: low_max = 95;  moderate_max = 207; high_max = 703; break;
+    case POLLEN_GRASS: low_max = 29;  moderate_max = 60;  high_max = 341; break;
+    case POLLEN_WEEDS: default: low_max = 20; moderate_max = 77; high_max = 266; break;
+  }
+
+  if (value <= low_max) return 0;
+  if (value <= moderate_max) return 1;
+  if (value <= high_max) return 2;
+  return 3;
+}
+
+static const char *pollen_tier_label(int tier) {
+  switch (tier) {
+    case 0: return "Low";
+    case 1: return "Moderate";
+    case 2: return "High";
+    case 3: return "Very High";
+    default: return "N/A";
+  }
+}
+
+static GColor pollen_tier_bg_color(int tier) {
+  switch (tier) {
+    case 0: return GColorFromRGB(0, 255, 0);    // Low
+    case 1: return GColorFromRGB(255, 190, 0);  // Moderate
+    case 2: return GColorFromRGB(255, 120, 0);  // High
+    case 3: return GColorFromRGB(220, 0, 0);    // Very High
+    default: return GColorWhite;                 // N/A
+  }
+}
+
+static GColor pollen_tier_fg_color(int tier) {
+  if (tier >= 2) return GColorWhite;
+  return GColorBlack;
+}
+
+// ---------------------------------------------------------------------
 // Text helpers
 // ---------------------------------------------------------------------
 
@@ -108,14 +172,19 @@ static GFont pick_fit_font(const char *text, int max_width, const GFont *candida
   return candidates[count - 1];
 }
 
-// Draws text horizontally AND vertically centered within box.
-static void draw_centered_text(GContext *ctx, const char *text, GFont font, GRect box) {
+// Draws text vertically centered within box, at the given horizontal alignment.
+static void draw_aligned_text(GContext *ctx, const char *text, GFont font, GRect box, GTextAlignment align) {
   GSize sz = graphics_text_layout_get_content_size(text, font, GRect(0, 0, box.size.w, 200),
-                                                     GTextOverflowModeFill, GTextAlignmentCenter);
+                                                     GTextOverflowModeFill, align);
   int y_off = (box.size.h - sz.h) / 2;
   if (y_off < 0) y_off = 0;
   GRect r = GRect(box.origin.x, box.origin.y + y_off, box.size.w, sz.h + 2);
-  graphics_draw_text(ctx, text, font, r, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  graphics_draw_text(ctx, text, font, r, GTextOverflowModeFill, align, NULL);
+}
+
+// Draws text horizontally AND vertically centered within box.
+static void draw_centered_text(GContext *ctx, const char *text, GFont font, GRect box) {
+  draw_aligned_text(ctx, text, font, box, GTextAlignmentCenter);
 }
 
 static void fmt_int(char *buf, size_t buflen, int v) {
@@ -232,26 +301,51 @@ static void parse_graph(const char *data) {
     char *next_row = strchr(cursor, '|');
     if (next_row) *next_row = '\0';
 
+    int vals[4];
     char *p = cursor;
-    char *c1 = strchr(p, ',');
-    if (!c1) { cursor = next_row ? next_row + 1 : NULL; continue; }
-    *c1 = '\0';
-    char *hour_s = p;
-    p = c1 + 1;
+    int idx = 0;
+    bool ok = true;
+    while (idx < 4) {
+      char *c = strchr(p, ',');
+      if (idx < 3 && !c) { ok = false; break; }
+      if (c) *c = '\0';
+      vals[idx++] = atoi(p);
+      if (!c) break;
+      p = c + 1;
+    }
 
-    char *c2 = strchr(p, ',');
-    if (!c2) { cursor = next_row ? next_row + 1 : NULL; continue; }
-    *c2 = '\0';
-    char *birch_s = p;
-    char *grass_s = c2 + 1;
-
-    s_graph[s_graph_count].hour = atoi(hour_s);
-    s_graph[s_graph_count].birch = atoi(birch_s);
-    s_graph[s_graph_count].grass = atoi(grass_s);
-    s_graph_count++;
+    if (ok && idx == 4) {
+      s_graph[s_graph_count].hour = vals[0];
+      s_graph[s_graph_count].trees = vals[1];
+      s_graph[s_graph_count].grass = vals[2];
+      s_graph[s_graph_count].weeds = vals[3];
+      s_graph_count++;
+    }
 
     cursor = next_row ? next_row + 1 : NULL;
   }
+}
+
+// Parses "trees,grass,weeds" (each already summed on the phone side).
+static void parse_pollen_category(const char *data) {
+  char buffer[48];
+  strncpy(buffer, data, sizeof(buffer) - 1);
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  int vals[3] = { NO_DATA, NO_DATA, NO_DATA };
+  char *cursor = buffer;
+  int idx = 0;
+  while (cursor && *cursor && idx < 3) {
+    char *next = strchr(cursor, ',');
+    if (next) *next = '\0';
+    vals[idx++] = atoi(cursor);
+    cursor = next ? next + 1 : NULL;
+  }
+  if (idx < 3) return;
+
+  s_pollen_trees = vals[0];
+  s_pollen_grass = vals[1];
+  s_pollen_weeds = vals[2];
 }
 
 static void inbox_received_handler(DictionaryIterator *iter, void *context) {
@@ -261,6 +355,7 @@ static void inbox_received_handler(DictionaryIterator *iter, void *context) {
   Tuple *loc_tuple = dict_find(iter, MESSAGE_KEY_LOCATION_NAME);
   Tuple *season_tuple = dict_find(iter, MESSAGE_KEY_POLLEN_SEASON);
   Tuple *graph_tuple = dict_find(iter, MESSAGE_KEY_GRAPH_DATA);
+  Tuple *pollen_cat_tuple = dict_find(iter, MESSAGE_KEY_POLLEN_CATEGORY_DATA);
 
   if (loc_tuple) {
     strncpy(s_location_name, loc_tuple->value->cstring, sizeof(s_location_name) - 1);
@@ -278,6 +373,9 @@ static void inbox_received_handler(DictionaryIterator *iter, void *context) {
     s_pollen_season = season_tuple ? (season_tuple->value->int32 != 0) : false;
     if (s_pollen_season && graph_tuple) {
       parse_graph(graph_tuple->value->cstring);
+    }
+    if (pollen_cat_tuple) {
+      parse_pollen_category(pollen_cat_tuple->value->cstring);
     }
     s_has_data = (s_row_count > 0);
     APP_LOG(APP_LOG_LEVEL_DEBUG, "row_count: %d, has_data: %d", s_row_count, s_has_data);
@@ -309,6 +407,8 @@ static void inbox_received_handler(DictionaryIterator *iter, void *context) {
     layer_set_hidden(s_graph_layer, !s_has_data);
     layer_mark_dirty(s_graph_layer);
   }
+
+  refresh_pollen_box();
 }
 
 static void inbox_dropped_handler(AppMessageResult reason, void *context) {
@@ -331,66 +431,92 @@ static void main_grid_update_proc(Layer *layer, GContext *ctx) {
   if (!s_has_data) return;
   GRect b = layer_get_bounds(layer);
 
-  int col_w = b.size.w / 2;
-  int row_h = b.size.h / 3;
+  int row_h = b.size.h / 6;
   int border = 2;
+  int side_pad = 6;
 
-  static const char *labels[3][2] = {
-    {"PM2.5 ug/m3", "PM10 ug/m3"},
-    {"NO2 ug/m3", "O3 ug/m3"},
-    {"Temp C", "UV Index"}
+  static const char *labels[6] = {
+    "PM2.5 ug/m3", "PM10 ug/m3", "NO2 ug/m3", "Ozone (O3)", "Temp C", "UV Index"
   };
 
-  char values[3][2][12];
-  fmt_int(values[0][0], sizeof(values[0][0]), s_current.pm25);
-  fmt_int(values[0][1], sizeof(values[0][1]), s_current.pm10);
-  fmt_int(values[1][0], sizeof(values[1][0]), s_current.no2);
-  fmt_int(values[1][1], sizeof(values[1][1]), s_current.o3);
-  fmt_int(values[2][0], sizeof(values[2][0]), s_current.temp);
-  fmt_uv(values[2][1], sizeof(values[2][1]), s_current.uv10);
+  char values[6][12];
+  fmt_int(values[0], sizeof(values[0]), s_current.pm25);
+  fmt_int(values[1], sizeof(values[1]), s_current.pm10);
+  fmt_int(values[2], sizeof(values[2]), s_current.no2);
+  fmt_int(values[3], sizeof(values[3]), s_current.o3);
+  fmt_int(values[4], sizeof(values[4]), s_current.temp);
+  fmt_uv(values[5], sizeof(values[5]), s_current.uv10);
 
-  GColor bg[3][2] = {
-    { eaqi_to_bg_color(s_current.aqi_pm25), eaqi_to_bg_color(s_current.aqi_pm10) },
-    { eaqi_to_bg_color(s_current.aqi_no2), eaqi_to_bg_color(s_current.aqi_o3) },
-    { GColorWhite, GColorWhite } // Temperature & UV: no colour coding
+  GColor bg[6] = {
+    eaqi_to_bg_color(s_current.aqi_pm25),
+    eaqi_to_bg_color(s_current.aqi_pm10),
+    eaqi_to_bg_color(s_current.aqi_no2),
+    eaqi_to_bg_color(s_current.aqi_o3),
+    GColorWhite, // Temperature: no colour coding
+    GColorWhite  // UV Index: no colour coding
   };
-  GColor fg[3][2] = {
-    { eaqi_to_fg_color(s_current.aqi_pm25), eaqi_to_fg_color(s_current.aqi_pm10) },
-    { eaqi_to_fg_color(s_current.aqi_no2), eaqi_to_fg_color(s_current.aqi_o3) },
-    { GColorBlack, GColorBlack }
-  };
-
-  GFont label_candidates[3] = {
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_09) // no 09_BOLD exists in the system font set
-  };
-  GFont value_candidates[3] = {
-    fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+  GColor fg[6] = {
+    eaqi_to_fg_color(s_current.aqi_pm25),
+    eaqi_to_fg_color(s_current.aqi_pm10),
+    eaqi_to_fg_color(s_current.aqi_no2),
+    eaqi_to_fg_color(s_current.aqi_o3),
+    GColorBlack,
+    GColorBlack
   };
 
-  for (int i = 0; i < 3; i++) {
-    for (int c = 0; c < 2; c++) {
-      GRect cell = GRect(c * col_w + border, i * row_h + border,
-                          col_w - 2 * border, row_h - 2 * border);
+  // Fixed size for everything, rather than auto-fit per bar - PM2.5's
+  // label is the longest text of the six ("PM2.5 ug/m3"), so whatever
+  // size comfortably fits that is guaranteed to fit every shorter label
+  // and value too. GOTHIC_14_BOLD is what PM2.5 was already landing on.
+  GFont bar_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 
-      graphics_context_set_fill_color(ctx, bg[i][c]);
-      graphics_fill_rect(ctx, cell, 0, GCornerNone);
+  for (int i = 0; i < 6; i++) {
+    GRect bar = GRect(border, i * row_h + border, b.size.w - 2 * border, row_h - 2 * border);
 
-      int label_h = (cell.size.h * 2) / 5;
-      GRect label_box = GRect(cell.origin.x, cell.origin.y, cell.size.w, label_h);
-      GRect value_box = GRect(cell.origin.x, cell.origin.y + label_h, cell.size.w, cell.size.h - label_h);
+    graphics_context_set_fill_color(ctx, bg[i]);
+    graphics_fill_rect(ctx, bar, 0, GCornerNone);
 
-      GFont lf = pick_fit_font(labels[i][c], cell.size.w - 4, label_candidates, 3);
-      GFont vf = pick_fit_font(values[i][c], cell.size.w - 4, value_candidates, 3);
+    // 65/35 split: labels are consistently longer than the short numeric
+    // values, so give them the bigger share rather than an even half.
+    int label_w = (bar.size.w * 65) / 100;
+    GRect label_box = GRect(bar.origin.x + side_pad, bar.origin.y, label_w - side_pad, bar.size.h);
+    GRect value_box = GRect(bar.origin.x + label_w, bar.origin.y,
+                             bar.size.w - label_w - side_pad, bar.size.h);
 
-      graphics_context_set_text_color(ctx, fg[i][c]);
-      draw_centered_text(ctx, labels[i][c], lf, label_box);
-      draw_centered_text(ctx, values[i][c], vf, value_box);
-    }
+    graphics_context_set_text_color(ctx, fg[i]);
+    draw_aligned_text(ctx, labels[i], bar_font, label_box, GTextAlignmentLeft);
+    draw_aligned_text(ctx, values[i], bar_font, value_box, GTextAlignmentRight);
   }
+}
+
+// Draws the EAQI box: background fill over the full (unchanged) frame,
+// text vertically centered but nudged up 2px within it - clamped so it
+// never rises above the box's own top edge.
+static void eaqi_box_update_proc(Layer *layer, GContext *ctx) {
+  GRect b = layer_get_bounds(layer);
+
+  graphics_context_set_fill_color(ctx, s_eaqi_bg);
+  graphics_fill_rect(ctx, b, 0, GCornerNone);
+
+  if (s_eaqi_text[0] == '\0') return;
+
+  GFont eaqi_candidates[3] = {
+    fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD)
+  };
+  GFont font = pick_fit_font(s_eaqi_text, b.size.w - 4, eaqi_candidates, 3);
+
+  GSize sz = graphics_text_layout_get_content_size(s_eaqi_text, font, GRect(0, 0, b.size.w, 200),
+                                                     GTextOverflowModeFill, GTextAlignmentCenter);
+  int y_off = (b.size.h - sz.h) / 2 - 6; // 2px higher than dead-centre
+  if (y_off < -6) y_off = -6; // allow a couple px of top overflow rather than
+                               // cancelling the shift back to 0 when there's
+                               // little natural padding to begin with
+
+  graphics_context_set_text_color(ctx, s_eaqi_fg);
+  GRect r = GRect(b.origin.x, b.origin.y + y_off, b.size.w, sz.h + 2);
+  graphics_draw_text(ctx, s_eaqi_text, font, r, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
 
 static void refresh_main_window(void) {
@@ -402,28 +528,51 @@ static void refresh_main_window(void) {
     text_layer_set_text(s_main_status_layer, s_status_text);
     layer_set_hidden(text_layer_get_layer(s_main_status_layer), false);
     layer_set_hidden(s_grid_layer, true);
-    text_layer_set_text(s_eaqi_layer, "");
-    text_layer_set_background_color(s_eaqi_layer, GColorClear);
+    s_eaqi_text[0] = '\0';
+    s_eaqi_bg = GColorClear;
+    layer_mark_dirty(s_eaqi_layer);
     return;
   }
   layer_set_hidden(text_layer_get_layer(s_main_status_layer), true);
   layer_set_hidden(s_grid_layer, false);
   layer_mark_dirty(s_grid_layer);
 
-  static char eaqi_buf[24];
-  snprintf(eaqi_buf, sizeof(eaqi_buf), "EAQI: %s", eaqi_to_label(s_current.aqi_overall));
+  snprintf(s_eaqi_text, sizeof(s_eaqi_text), "EAQI: %s", eaqi_to_label(s_current.aqi_overall));
+  s_eaqi_bg = eaqi_to_bg_color(s_current.aqi_overall);
+  s_eaqi_fg = eaqi_to_fg_color(s_current.aqi_overall);
+  layer_mark_dirty(s_eaqi_layer);
+}
 
-  GRect eaqi_bounds = layer_get_bounds(text_layer_get_layer(s_eaqi_layer));
-  GFont eaqi_candidates[3] = {
-    fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD)
-  };
-  GFont eaqi_font = pick_fit_font(eaqi_buf, eaqi_bounds.size.w - 4, eaqi_candidates, 3);
-  text_layer_set_font(s_eaqi_layer, eaqi_font);
-  text_layer_set_text(s_eaqi_layer, eaqi_buf);
-  text_layer_set_background_color(s_eaqi_layer, eaqi_to_bg_color(s_current.aqi_overall));
-  text_layer_set_text_color(s_eaqi_layer, eaqi_to_fg_color(s_current.aqi_overall));
+// Populates the graph screen's pollen category box from whatever global
+// pollen data is currently available. Called both reactively (when new
+// data arrives) and at graph_window_load time, since the box may be
+// created well after the data it needs to display already arrived (e.g.
+// data fetched while the person was still on the main screen).
+static void refresh_pollen_box(void) {
+  if (!s_pollen_box_layer) return; // graph window not currently loaded
+
+  if (!s_has_data) {
+    text_layer_set_text(s_pollen_box_layer, "");
+    text_layer_set_background_color(s_pollen_box_layer, GColorClear);
+    return;
+  }
+
+  int tier_trees = pollen_tier(s_pollen_trees, POLLEN_TREES);
+  int tier_grass = pollen_tier(s_pollen_grass, POLLEN_GRASS);
+  int tier_weeds = pollen_tier(s_pollen_weeds, POLLEN_WEEDS);
+
+  // Overall = worst (highest) tier among the three categories that
+  // actually has data; -1 (N/A) only if all three are absent.
+  int overall_tier = -1;
+  if (tier_trees > overall_tier) overall_tier = tier_trees;
+  if (tier_grass > overall_tier) overall_tier = tier_grass;
+  if (tier_weeds > overall_tier) overall_tier = tier_weeds;
+
+  static char pollen_buf[20];
+  snprintf(pollen_buf, sizeof(pollen_buf), "Pollen: %s", pollen_tier_label(overall_tier));
+  text_layer_set_text(s_pollen_box_layer, pollen_buf);
+  text_layer_set_background_color(s_pollen_box_layer, pollen_tier_bg_color(overall_tier));
+  text_layer_set_text_color(s_pollen_box_layer, pollen_tier_fg_color(overall_tier));
 }
 
 static void main_up_click(ClickRecognizerRef recognizer, void *context) {
@@ -475,11 +624,9 @@ static void main_window_load(Window *window) {
   layer_set_update_proc(s_grid_layer, main_grid_update_proc);
   layer_add_child(window_layer, s_grid_layer);
 
-  s_eaqi_layer = text_layer_create(GRect(4, bounds.size.h - eaqi_h, content_width - 8, eaqi_h));
-  text_layer_set_font(s_eaqi_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
-  text_layer_set_text_alignment(s_eaqi_layer, GTextAlignmentCenter);
-  text_layer_set_text(s_eaqi_layer, "");
-  layer_add_child(window_layer, text_layer_get_layer(s_eaqi_layer));
+  s_eaqi_layer = layer_create(GRect(4, bounds.size.h - eaqi_h, content_width - 8, eaqi_h));
+  layer_set_update_proc(s_eaqi_layer, eaqi_box_update_proc);
+  layer_add_child(window_layer, s_eaqi_layer);
 
   s_main_status_layer = text_layer_create(GRect(0, bounds.size.h / 2 - 20, content_width, 40));
   text_layer_set_text_alignment(s_main_status_layer, GTextAlignmentCenter);
@@ -497,7 +644,7 @@ static void main_window_unload(Window *window) {
   gbitmap_destroy(s_icon_refresh);
   text_layer_destroy(s_location_layer);
   layer_destroy(s_grid_layer);
-  text_layer_destroy(s_eaqi_layer);
+  layer_destroy(s_eaqi_layer);
   text_layer_destroy(s_main_status_layer);
 
   s_location_layer = NULL;
@@ -729,7 +876,7 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
   int margin_left = 28;
   int margin_top = 6;
   int hour_label_h = 16;
-  int legend_h = 32; // two lines of legend text
+  int legend_h = 48; // three lines of legend text
   int margin_bottom = hour_label_h + legend_h;
 
   int plot_w = bounds.size.w - margin_left - 6;
@@ -737,10 +884,15 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
   int origin_x = margin_left;
   int origin_y = margin_top + plot_h;
 
+  GColor trees_color = GColorFromRGB(140, 90, 40); // brown
+  GColor grass_color = GColorFromRGB(0, 140, 0);   // green
+  GColor weeds_color = GColorFromRGB(140, 0, 140); // purple
+
   int max_val = 1;
   for (int i = 0; i < s_graph_count; i++) {
-    if (s_graph[i].birch > max_val) max_val = s_graph[i].birch;
+    if (s_graph[i].trees > max_val) max_val = s_graph[i].trees;
     if (s_graph[i].grass > max_val) max_val = s_graph[i].grass;
+    if (s_graph[i].weeds > max_val) max_val = s_graph[i].weeds;
   }
   int step = nice_step(max_val);
   int y_max = ((max_val / step) + 1) * step;
@@ -765,30 +917,39 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
                         GTextOverflowModeFill, GTextAlignmentRight, NULL);
   }
 
-  GPoint prev_birch = GPoint(0, 0), prev_grass = GPoint(0, 0);
+  GPoint prev_trees = GPoint(0, 0), prev_grass = GPoint(0, 0), prev_weeds = GPoint(0, 0);
   for (int i = 0; i < s_graph_count; i++) {
     int x = origin_x + (i * plot_w) / (s_graph_count - 1);
 
-    int vb = s_graph[i].birch > y_max ? y_max : s_graph[i].birch;
-    GPoint pb = GPoint(x, origin_y - (vb * plot_h) / y_max);
+    int vt = s_graph[i].trees > y_max ? y_max : s_graph[i].trees;
+    GPoint pt = GPoint(x, origin_y - (vt * plot_h) / y_max);
 
     int vg = s_graph[i].grass > y_max ? y_max : s_graph[i].grass;
     GPoint pg = GPoint(x, origin_y - (vg * plot_h) / y_max);
 
-    if (i > 0) {
-      graphics_context_set_stroke_color(ctx, GColorFromRGB(140, 90, 40)); // Birch - brown, solid
-      graphics_context_set_stroke_width(ctx, 2);
-      graphics_draw_line(ctx, prev_birch, pb);
+    int vw = s_graph[i].weeds > y_max ? y_max : s_graph[i].weeds;
+    GPoint pw = GPoint(x, origin_y - (vw * plot_h) / y_max);
 
-      graphics_context_set_stroke_color(ctx, GColorFromRGB(0, 140, 0)); // Grass - green, dashed
+    if (i > 0) {
+      graphics_context_set_stroke_color(ctx, trees_color); // Trees - solid
+      graphics_context_set_stroke_width(ctx, 2);
+      graphics_draw_line(ctx, prev_trees, pt);
+
+      graphics_context_set_stroke_color(ctx, grass_color); // Grass - dashed
       graphics_context_set_stroke_width(ctx, 2);
       draw_dashed_line(ctx, prev_grass, pg, 4);
+
+      graphics_context_set_stroke_color(ctx, weeds_color); // Weeds - dotted (denser dashing)
+      graphics_context_set_stroke_width(ctx, 2);
+      draw_dashed_line(ctx, prev_weeds, pw, 8);
     }
 
-    graphics_context_set_fill_color(ctx, GColorFromRGB(140, 90, 40));
-    graphics_fill_circle(ctx, pb, 2);
-    graphics_context_set_fill_color(ctx, GColorFromRGB(0, 140, 0));
+    graphics_context_set_fill_color(ctx, trees_color);
+    graphics_fill_circle(ctx, pt, 2);
+    graphics_context_set_fill_color(ctx, grass_color);
     graphics_fill_circle(ctx, pg, 2);
+    graphics_context_set_fill_color(ctx, weeds_color);
+    graphics_fill_circle(ctx, pw, 2);
 
     if (i % 4 == 0) { // thin out hour labels to avoid crowding
       char hbuf[4];
@@ -798,28 +959,42 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
                           GTextOverflowModeFill, GTextAlignmentCenter, NULL);
     }
 
-    prev_birch = pb;
+    prev_trees = pt;
     prev_grass = pg;
+    prev_weeds = pw;
   }
 
-  graphics_context_set_text_color(ctx, GColorFromRGB(140, 90, 40));
-  draw_centered_text(ctx, "Birch pollen ----", legend_font,
-                      GRect(0, bounds.size.h - legend_h, bounds.size.w, legend_h / 2));
-  graphics_context_set_text_color(ctx, GColorFromRGB(0, 140, 0));
-  draw_centered_text(ctx, "Grass pollen - - -", legend_font,
-                      GRect(0, bounds.size.h - legend_h / 2, bounds.size.w, legend_h / 2));
+  int legend_line_h = legend_h / 3;
+  graphics_context_set_text_color(ctx, trees_color);
+  draw_centered_text(ctx, "Trees ----", legend_font,
+                      GRect(0, bounds.size.h - legend_h, bounds.size.w, legend_line_h));
+  graphics_context_set_text_color(ctx, grass_color);
+  draw_centered_text(ctx, "Grass - - -", legend_font,
+                      GRect(0, bounds.size.h - legend_h + legend_line_h, bounds.size.w, legend_line_h));
+  graphics_context_set_text_color(ctx, weeds_color);
+  draw_centered_text(ctx, "Weeds ......", legend_font,
+                      GRect(0, bounds.size.h - legend_line_h, bounds.size.w, legend_line_h));
 }
 
 static void graph_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
 
-  s_graph_layer = layer_create(bounds);
+  s_pollen_box_layer = text_layer_create(GRect(0, 0, bounds.size.w, POLLEN_BOX_HEIGHT));
+  text_layer_set_font(s_pollen_box_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
+  text_layer_set_text_alignment(s_pollen_box_layer, GTextAlignmentCenter);
+  text_layer_set_text(s_pollen_box_layer, "");
+  layer_add_child(window_layer, text_layer_get_layer(s_pollen_box_layer));
+  refresh_pollen_box(); // data may already be available even if this box wasn't
+
+  GRect graph_bounds = GRect(0, POLLEN_BOX_HEIGHT, bounds.size.w, bounds.size.h - POLLEN_BOX_HEIGHT);
+  s_graph_layer = layer_create(graph_bounds);
   layer_set_update_proc(s_graph_layer, graph_update_proc);
   layer_set_hidden(s_graph_layer, !s_has_data);
   layer_add_child(window_layer, s_graph_layer);
 
-  s_graph_status_layer = text_layer_create(GRect(0, bounds.size.h / 2 - 20, bounds.size.w, 40));
+  s_graph_status_layer = text_layer_create(GRect(0, POLLEN_BOX_HEIGHT + graph_bounds.size.h / 2 - 20,
+                                                  bounds.size.w, 40));
   text_layer_set_text_alignment(s_graph_status_layer, GTextAlignmentCenter);
   text_layer_set_font(s_graph_status_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
   text_layer_set_text(s_graph_status_layer, s_has_data ? "" : s_status_text);
@@ -830,8 +1005,10 @@ static void graph_window_load(Window *window) {
 static void graph_window_unload(Window *window) {
   layer_destroy(s_graph_layer);
   text_layer_destroy(s_graph_status_layer);
+  text_layer_destroy(s_pollen_box_layer);
   s_graph_layer = NULL;
   s_graph_status_layer = NULL;
+  s_pollen_box_layer = NULL;
 }
 
 // ---------------------------------------------------------------------

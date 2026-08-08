@@ -78,25 +78,65 @@ function buildForecastPayload(aq, weather, startIdx) {
 
 function buildGraphPayload(aq, startIdx) {
   var times = aq.hourly.time;
+  var alder = aq.hourly.alder_pollen;
   var birch = aq.hourly.birch_pollen;
+  var olive = aq.hourly.olive_pollen;
   var grass = aq.hourly.grass_pollen;
+  var mugwort = aq.hourly.mugwort_pollen;
+  var ragweed = aq.hourly.ragweed_pollen;
 
   var endIdx = Math.min(startIdx + 24, times.length);
   var rows = [];
   var seasonActive = false;
 
   for (var j = startIdx; j < endIdx; j++) {
-    var b = birch ? birch[j] : null;
-    var g = grass ? grass[j] : null;
-    if (b !== null && b !== undefined) seasonActive = true;
-    if (g !== null && g !== undefined) seasonActive = true;
+    var treesVal = sumSpecies([
+      alder ? alder[j] : null, birch ? birch[j] : null, olive ? olive[j] : null
+    ]);
+    var grassVal = sumSpecies([grass ? grass[j] : null]);
+    var weedsVal = sumSpecies([mugwort ? mugwort[j] : null, ragweed ? ragweed[j] : null]);
+
+    if (treesVal !== null || grassVal !== null || weedsVal !== null) seasonActive = true;
 
     var hour = parseInt(times[j].substring(11, 13), 10);
-    rows.push([hour, r(b === null || b === undefined ? 0 : b),
-                      r(g === null || g === undefined ? 0 : g)].join(','));
+    rows.push([
+      hour,
+      treesVal === null ? 0 : treesVal,
+      grassVal === null ? 0 : grassVal,
+      weedsVal === null ? 0 : weedsVal
+    ].join(','));
   }
 
   return { season: seasonActive, payload: rows.join('|') };
+}
+
+// Sums whichever of the given species values are non-null. Returns null
+// (not 0) if every value in the group is null/undefined, so a fully-absent
+// category can be distinguished from a genuinely-zero one.
+function sumSpecies(values) {
+  var anyData = false;
+  var total = 0;
+  for (var i = 0; i < values.length; i++) {
+    var v = values[i];
+    if (v !== null && v !== undefined) {
+      anyData = true;
+      total += v;
+    }
+  }
+  return anyData ? Math.round(total) : null;
+}
+
+function buildPollenCategoryPayload(aq) {
+  var c = aq.current;
+  var trees = sumSpecies([c.alder_pollen, c.birch_pollen, c.olive_pollen]);
+  var grass = sumSpecies([c.grass_pollen]);
+  var weeds = sumSpecies([c.mugwort_pollen, c.ragweed_pollen]);
+
+  return [
+    trees === null ? NO_DATA : trees,
+    grass === null ? NO_DATA : grass,
+    weeds === null ? NO_DATA : weeds
+  ].join(',');
 }
 
 function fetchLocationName(lat, lon, callback) {
@@ -127,8 +167,10 @@ function fetchAirQuality(lat, lon, callback) {
   var url = 'https://air-quality-api.open-meteo.com/v1/air-quality' +
             '?latitude=' + lat + '&longitude=' + lon +
             '&current=pm2_5,pm10,nitrogen_dioxide,ozone,uv_index,european_aqi,' +
-            'european_aqi_pm2_5,european_aqi_pm10,european_aqi_nitrogen_dioxide,european_aqi_ozone' +
-            '&hourly=pm2_5,pm10,nitrogen_dioxide,ozone,uv_index,birch_pollen,grass_pollen' +
+            'european_aqi_pm2_5,european_aqi_pm10,european_aqi_nitrogen_dioxide,european_aqi_ozone,' +
+            'alder_pollen,birch_pollen,grass_pollen,mugwort_pollen,olive_pollen,ragweed_pollen' +
+            '&hourly=pm2_5,pm10,nitrogen_dioxide,ozone,uv_index,' +
+            'alder_pollen,birch_pollen,grass_pollen,mugwort_pollen,olive_pollen,ragweed_pollen' +
             '&timezone=auto&forecast_days=2';
 
   var xhr = new XMLHttpRequest();
@@ -203,7 +245,8 @@ function fetchAndSend() {
             'CURRENT_DATA': buildCurrentPayload(aqData, weatherData),
             'FORECAST_DATA': buildForecastPayload(aqData, weatherData, startIdx),
             'POLLEN_SEASON': graph.season ? 1 : 0,
-            'GRAPH_DATA': graph.payload
+            'GRAPH_DATA': graph.payload,
+            'POLLEN_CATEGORY_DATA': buildPollenCategoryPayload(aqData)
           },
           function() { console.log('Air quality data sent'); },
           function(e) { console.log('Send failed: ' + JSON.stringify(e)); }

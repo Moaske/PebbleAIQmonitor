@@ -16,7 +16,8 @@
             "CURRENT_DATA",
             "FORECAST_DATA",
             "POLLEN_SEASON",
-            "GRAPH_DATA"
+            "GRAPH_DATA",
+            "POLLEN_CATEGORY_DATA"
         ],
         "projectType": "native",
         "resources": {
@@ -57,5 +58,5 @@
             "watchface": false
         }
     },
-    "version": "1.0.4"
+    "version": "1.5.0"
 }
