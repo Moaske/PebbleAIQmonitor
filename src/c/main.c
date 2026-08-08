@@ -1,7 +1,7 @@
 #include <pebble.h>
 
 #define MAX_ROWS 24
-#define GRAPH_POINTS 6
+#define GRAPH_POINTS 12
 #define ACTIONBAR_ICON_WIDTH 30
 
 // Wind unit: 0 = km/h (default), 1 = mph, 2 = m/s, 3 = knots. Values
@@ -758,6 +758,9 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
   int label_half_h = compact ? 7 : 10;
   int hour_half_w = compact ? 12 : 18;
   int hour_w = compact ? 24 : 36;
+  // With 12 points on the time axis, only every Nth hour gets a label so
+  // they don't collide - narrower (compact) screens skip more aggressively.
+  int hour_label_step = compact ? 3 : 2;
 
   graphics_context_set_stroke_color(ctx, GColorBlack);
   graphics_draw_line(ctx, GPoint(origin_x, margin_top), GPoint(origin_x, origin_y));
@@ -807,21 +810,23 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
 
         graphics_context_set_stroke_color(ctx, GColorDarkCandyAppleRed);
         graphics_context_set_stroke_width(ctx, 3);
-        draw_dashed_line(ctx, prev_gust, pgust, 4);
+        draw_dashed_line(ctx, prev_gust, pgust, 2);
 
         graphics_context_set_fill_color(ctx, GColorBlack);
-        draw_dotted_line(ctx, prev_100, p100, 10);
+        draw_dotted_line(ctx, prev_100, p100, 5);
       }
 
       graphics_context_set_fill_color(ctx, color_for_value(s_rows[i].wind10));
       graphics_fill_circle(ctx, p10, 3);
 
-      char hbuf[4];
-      snprintf(hbuf, sizeof(hbuf), "%02d", s_rows[i].hour);
-      graphics_context_set_text_color(ctx, GColorBlack);
-      graphics_draw_text(ctx, hbuf, label_font,
-                          GRect(x - hour_half_w, origin_y + 4, hour_w, hour_label_h),
-                          GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+      if (i % hour_label_step == 0 || i == points - 1) {
+        char hbuf[4];
+        snprintf(hbuf, sizeof(hbuf), "%02d", s_rows[i].hour);
+        graphics_context_set_text_color(ctx, GColorBlack);
+        graphics_draw_text(ctx, hbuf, label_font,
+                            GRect(x - hour_half_w, origin_y + 4, hour_w, hour_label_h),
+                            GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+      }
 
       prev10 = p10;
       prev_gust = pgust;
